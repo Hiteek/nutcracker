@@ -54,6 +54,52 @@ migrar secretos a variables de entorno (ver Fase 0).
 
 ---
 
+## Estado de avance (actualizado 2026-07-24)
+
+Revisión del commit `90fad34 "advance"` (posterior al commit del plan) contra este documento.
+
+| Fase | Estado |
+|---|---|
+| **Fase 0** — Fundamentos + persistencia | ✅ **Completa** (con 2 huecos menores, ver abajo) |
+| **Fase 1** — Cola + scheduler | ✅ **Completa** (POC verificada con APK real, ver abajo) |
+| **Fase 2** — OWASP MAS | ❌ No iniciada |
+| **Fase 3** — Dashboard web | ❌ No iniciada |
+
+### Fase 0 — detalle de lo entregado
+- ✅ **0.1 Persistencia SQLite**: `nutcracker_core/store/{db,repository,hooks}.py` + `schema.sql`.
+  Esquema idéntico al planeado (`apps, runs, findings, artifacts, schedule`); `findings` ya trae
+  columnas `masvs/maswe/cwe` listas para la Fase 2. Doble escritura no destructiva confirmada:
+  `store/hooks.py::install()` registra el post-hook `after_analysis` (llamado desde
+  `cli/__init__.py`); los JSON/PDF en disco siguen intactos.
+- ✅ **0.2 Refactor CLI**: `nutcracker.py` quedó en **18 líneas** (shim → `from nutcracker_core.cli
+  import cli`). Paquete `cli/` con `scan.py, analyze.py, launch.py, batch.py, setup_token.py,
+  regen_pdf.py`. `orchestrator.py` (1.496 líneas) concentra la orquestación.
+- ✅ **0.3 Split de `vuln_scanner.py`**: nacieron `scan_types.py` y `leak_scanner.py`;
+  `vuln_scanner.py` bajó de ~1.400 a 456 líneas.
+- ✅ **0.4 Config con env vars**: `config.py` soporta `${ENV_VAR}`, cubierto por
+  `tests/test_config_env.py`.
+- ✅ **0.5 Tests base**: `pytest.ini`, `requirements-dev.txt`, `conftest.py` +
+  `test_store_repository.py`, `test_store_hooks.py`, `test_config_env.py`,
+  `test_vuln_scanner_split.py`.
+
+**Huecos abiertos dentro de Fase 0 (bloquean el arranque limpio de Fase 1):**
+1. ⚠️ `orchestrator.py` es un *lift-and-shift* de los helpers privados de `nutcracker.py`
+   (`_run_analysis`, `_post_analysis_flow`, etc.) — **no expone todavía una API pública
+   `run_static(apk)` / `run_dynamic(apk, serial)`** reutilizable por la cola. Se resuelve como
+   primer paso de la Fase 1 (ver 1.0 abajo) en vez de re-tocar Fase 0.
+2. ❌ `pyproject.toml` no existe todavía (empaquetado/entry-points) — se deja para el cierre de
+   mantenibilidad transversal, no bloquea Fase 1.
+3. ❔ Suite `pytest` no verificada en este entorno por falta de dependencias instaladas
+   (`loguru` ausente); es un problema de entorno local, no del código — pendiente de confirmar
+   en un entorno con `pip install -r requirements.txt -r requirements-dev.txt`.
+
+### Fase 1 — qué falta (antes de empezar, confirmado por inspección directa)
+Nada de esto existe aún: `nutcracker_core/queue/` (engine con pool estático paralelo + lock por
+device), `nutcracker_core/scheduler.py` (APScheduler), comando `nutcracker serve`, comandos
+`queue`/`schedule`, `batch --due`. `apscheduler` no está en `requirements.txt`.
+
+---
+
 ## Principios rectores
 - **No romper la frontera core/plugin.** Persistencia, cola y scheduler son **core** (utilidad general).
   El dashboard y la IA son **plugins**. El dashboard **lee** el store SQLite y **consume** el streaming de
@@ -142,6 +188,85 @@ Objetivo: `nutcracker serve` = daemon que encola, ejecuta y agenda revisiones pe
 
 **Entregable:** dado un `list_file`, el daemon revisa todas las apps, respeta paralelo/secuencial y
 device-lock, y re-agenda cada una a ≥1/mes automáticamente.
+
+### Fase 1 — estado: ✅ completa (2026-07-24)
+
+**Decisiones de diseño tomadas durante la implementación** (ajustan el texto original de
+esta fase a la realidad del código):
+
+- **Aislamiento por subproceso, no por hilo in-process.** `orchestrator.py` guarda estado
+  mutuo a nivel de módulo (`_CFG`, `_MANIFEST_ANALYSIS`, `_OSINT_RESULT`, ...) que no es
+  thread-safe entre análisis concurrentes. En vez de reescribir 1.500 líneas ya probadas,
+  cada job de la cola corre como **subproceso aislado** que invoca el CLI existente
+  (`nutcracker analyze`/`scan`), construido por el nuevo helper
+  `orchestrator.build_job_cmd()`. Esto da paralelismo real (sin GIL) y reutiliza el
+  pipeline al 100% sin duplicar lógica. `apply_static_only_override()` + el flag
+  `--static-only` (nuevo en `analyze`/`scan`) fuerzan decompilación jadx y evitan tocar el
+  dispositivo en jobs estáticos.
+- **Tabla `queue_jobs` separada de `runs`** (migración SQLite versión 2, `store/db.py`).
+  `runs` sigue siendo escrita únicamente por el post-hook `after_analysis`
+  (`store/hooks.py`) al terminar un análisis real; `queue_jobs` registra el ciclo de vida
+  del encolado (`queued→running→done/error`) y se enlaza al `run_id`/`package` reales vía
+  la variable de entorno `NUTCRACKER_QUEUE_JOB_ID`, que el subproceso hijo propaga hasta el
+  hook (`repository.link_job_run`). Evita adivinar el package antes de que el análisis
+  termine y evita duplicar filas en `runs`.
+- **Bug real encontrado y corregido en la propia POC:** cada invocación de
+  `nutcracker queue add` es un proceso nuevo, así que la lista en memoria `_pending` de
+  `QueueEngine` no persiste entre invocaciones. Sin corrección, un job encolado por un
+  proceso y drenado por otro (`queue add --run`, o el scheduler en un tick posterior) se
+  quedaba huérfano en estado `queued` para siempre. Fix: `QueueEngine.drain()` ahora llama
+  primero a `_load_queued_from_db()`, que recupera de SQLite cualquier job `queued` no
+  presente ya en memoria. `NutcrackerScheduler._tick()` también se simplificó para llamar
+  siempre a `drain()` (barato si no hay nada pendiente) en vez de solo cuando hay apps
+  vencidas — así recoge jobs encolados manualmente entre ticks. Regresión cubierta por
+  `tests/test_queue_engine.py::test_drain_picks_up_jobs_queued_by_a_different_engine_instance`.
+- **`batch` NO se migró internamente al motor de cola** (a diferencia de lo previsto en el
+  texto original de 1.3). Se mantiene tal cual (secuencial, in-process, ya probado) por
+  relación riesgo/beneficio: reescribirlo para reconstruir su resumen consolidado
+  (severidades, top findings, categorías) desde SQLite en vez de desde objetos en memoria
+  era un cambio de mayor superficie sin beneficio claro sobre simplemente ofrecer el nuevo
+  camino recomendado (`queue add <list_file>` + `serve`/`--run`), que cubre el mismo
+  entregable (revisión masiva con paralelo/secuencial + reintentable + persistida). Pendiente
+  como mejora futura opcional, no bloqueante.
+
+**Archivos nuevos:** `nutcracker_core/queue/{__init__,job,engine}.py`,
+`nutcracker_core/scheduler.py`, `nutcracker_core/cli/{serve,queue_cmd,schedule_cmd}.py`,
+`tests/test_queue_engine.py`, `tests/test_scheduler.py`.
+**Archivos modificados:** `store/schema` (vía migración en `db.py`, no se tocó
+`schema.sql`), `store/repository.py` (CRUD de `queue_jobs`), `store/hooks.py` (enlace
+`NUTCRACKER_QUEUE_JOB_ID`→`run_id`), `orchestrator.py` (`apply_static_only_override`,
+`build_job_cmd`), `cli/analyze.py`+`cli/scan.py` (`--static-only`), `cli/__init__.py`
+(registro de comandos), `requirements.txt` (+`apscheduler`), `config.yaml(.example)`
+(bloques `queue:`/`scheduler:`), `.gitignore` (+`nutcracker.db*`).
+
+**Comandos nuevos:** `nutcracker serve`, `nutcracker queue add|ls`, `nutcracker schedule set|ls`.
+
+**Tests:** 15 nuevos (`test_queue_engine.py` ×11, `test_scheduler.py` ×5, uno reemplazado) —
+paralelismo estático (timing), modo secuencial (pool=1), serialización por device-lock
+(mismo serial nunca solapa; seriales distintos sí paralelizan), rechazo de job dinámico sin
+`.apk` local, transición de estados + error capturado, re-agendado automático, filtro de
+`enqueue_due_apps`, y el fix de recuperación cross-proceso. Suite completa: **54/54 passing**
+(`.venv` con `requirements.txt`+`requirements-dev.txt`).
+
+**POC real ejecutada** (no simulada): usando un APK legítimo de Mobile Hacking Lab
+(`com.mobilehackinglab.iotconnect.apk`, entorno de entrenamiento en seguridad móvil ya
+presente en la máquina del usuario) copiado 3 veces, encolado vía **3 invocaciones
+separadas** de `nutcracker queue add` (2 sin `--run`, la 3ª con `--run`):
+- Los 3 jobs — encolados por procesos CLI distintos — se recuperaron y ejecutaron desde la
+  3ª invocación gracias al fix de `_load_queued_from_db()`.
+- `queue_jobs.started_at` idéntico para los 3 (`17:54:29`) → paralelismo real confirmado,
+  no solo solapamiento parcial. Tiempo total: **~84s** vs. ~174s que habría tomado en serie
+  (58s por análisis real × 3), con `static_workers=3`.
+- Cada job quedó enlazado a su `run_id`/`package` real (`com.mobilehackinglab.iotconnect`,
+  verdict `protected`, score 80, grade B, 1 finding `AUTH001`→`MASVS-AUTH-2`) — persistido en
+  `runs`/`findings` por el hook de Fase 0, sin tocarlo.
+- **Re-agendado automático confirmado**: sin que nadie llamara `schedule set`, al terminar
+  el primer job se creó una fila en `schedule` (`interval_days=30, enabled=1`) y
+  `apps.next_due_at` quedó en `last_run_at + 30 días` — el requisito "≥1 revisión/mes por
+  defecto" queda satisfecho automáticamente para cualquier app que pase por la cola.
+- `nutcracker serve` arranca (banner + "daemon activo"), corre el scheduler en background, y
+  se apaga con SIGTERM imprimiendo "nutcracker serve — detenido" (sin colgarse).
+- `nutcracker queue ls` y `nutcracker schedule ls` muestran el estado correctamente.
 
 ---
 
