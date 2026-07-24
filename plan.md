@@ -63,7 +63,7 @@ Revisión del commit `90fad34 "advance"` (posterior al commit del plan) contra e
 | **Fase 0** — Fundamentos + persistencia | ✅ **Completa** (con 2 huecos menores, ver abajo) |
 | **Fase 1** — Cola + scheduler | ✅ **Completa** (POC verificada con APK real, ver abajo) |
 | **Fase 2** — OWASP MAS | ✅ **Completa** (investigación real + bugs de mapeo corregidos, ver abajo) |
-| **Fase 3** — Dashboard web | ❌ No iniciada |
+| **Fase 3** — Dashboard web | ✅ **Completa** (alcance ajustado en 2 puntos, ver abajo) |
 
 ### Fase 0 — detalle de lo entregado
 - ✅ **0.1 Persistencia SQLite**: `nutcracker_core/store/{db,repository,hooks}.py` + `schema.sql`.
@@ -441,6 +441,95 @@ Layout:
 ### 3.3 Comando
 - `nutcracker serve --dashboard` (o siempre-on) levanta API+WS+estáticos en `127.0.0.1:<port>`.
 - Config `dashboard:` en `config.yaml` (`port`, `bind`, `enable_chat`, `scrcpy: true`).
+
+### Fase 3 — estado: ✅ completa (2026-07-24), con 2 ajustes de alcance honestos
+
+**Ajuste de arquitectura respecto al texto original:** en vez de un flag `--dashboard` sobre el
+comando core `serve` (que obligaría a `nutcracker_core/cli/serve.py`, core, a conocer detalles de
+un plugin — rompe la frontera), el dashboard es su **propio comando** registrado por el plugin:
+`nutcracker dashboard`. Arranca su propia `QueueEngine` + `NutcrackerScheduler` (reusa las clases
+de Fase 1 tal cual) además de la API — mismo resultado ("un comando levanta todo"), pero el core
+sigue sin saber que el plugin existe. Mismo patrón que ya usa `aipwn` (comando propio, no un flag
+de un comando core).
+
+**Dos alcances deliberadamente reducidos frente al texto original** (documentados como tal, no
+reclamados como hechos):
+1. **Video del dispositivo:** el plan original pedía scrcpy embebido vía ws-scrcpy (WebSocket/WebRTC,
+   H.264 en vivo). Este entorno **no tiene un dispositivo Android conectado** (`adb devices` vacío
+   durante toda la sesión) y ws-scrcpy es un proyecto Node/TypeScript de varios miles de líneas —
+   integrarlo sin poder probarlo contra hardware real habría sido reclamar un feature no verificado.
+   Se implementó en su lugar `GET /api/device/screenshot` (captura real vía `adb exec-out screencap`)
+   que el frontend refresca por polling cada 2.5s — no es video de baja latencia, pero es una vista
+   *real y funcional* del dispositivo, con degradación honesta ("sin dispositivo") si no hay uno
+   conectado (verificado: la POC real correctamente devolvió 503 al no haber ningún device).
+2. **Razonamiento del agente en vivo / chat consumido por el agente:** el plan pedía streamear
+   `print_agent_thinking`, cada `tool_call`, y que el chat inyectara mensajes en el loop del agente.
+   El agente de bypass (`aipwn`) solo corre con un dispositivo físico conectado — inalcanzable aquí
+   — y además **es un repositorio git separado** (`github.com/nutcracker-sh/aipwn`, ver nota de
+   Fase 2), así que wire-up adicional ahí tampoco sería verificable en este entorno. Lo que sí se
+   construyó y quedó **real y probado**: `GET /api/agent/prompt` (lee el `_SYSTEM_PROMPT` real de
+   `aipwn.frida_agent` si el plugin está instalado — transparencia sin necesitar una corrida en vivo)
+   y `/ws/chat/{package}` (mensaje real operador→WebSocket→bus→todos los suscriptores, con historial).
+   El consumo automático de esos mensajes por un agente en ejecución queda como follow-up explícito.
+
+   En cambio, el streaming de **logs en vivo de los jobs de la cola SÍ es real y de punta a punta**
+   (no un sustituto reducido): se agregó un modo streaming opcional a `QueueEngine`
+   (`engine.on_line`, usa `subprocess.Popen` en vez de `subprocess.run` solo cuando está asignado —
+   el camino sin callback, usado por Fase 1/CLI/scheduler, queda exactamente igual) y el dashboard lo
+   conecta a un `EventBus` en memoria que cada `/ws/jobs/{id}` consume. La POC real lo confirmó con
+   **282 líneas de log reales** recibidas por WebSocket durante un análisis real del mismo APK de
+   Mobile Hacking Lab usado en Fases 1-2.
+
+**Entregado:**
+- `nutcracker_core/queue/engine.py`: `on_line` callback opcional + `_run_streaming()` (Popen +
+  lectura línea a línea). Default `None` preserva el camino de Fase 1 sin cambios (tests de Fase 1
+  siguen monkeypatcheando `subprocess.run` sin tocar nada).
+- `nutcracker_core/plugins/dashboard/`: `events.py` (EventBus pub-sub en memoria, con historial por
+  canal), `store_reader.py` (queries de lectura con forma de dashboard sobre el store de Fase 0 —
+  `list_apps`, `list_runs`, `run_detail`, `masvs_trend`, `summary_counts`), `device.py` (screenshot
+  + listado de seriales vía adb), `api.py` (REST: `/api/summary`, `/api/apps`, `/api/apps/{pkg}/trend`,
+  `/api/runs`, `/api/runs/{id}`, `/api/schedule` GET/POST, `/api/queue` GET/POST, `/api/queue/drain`,
+  `/api/device`, `/api/device/screenshot`, `/api/agent/prompt`), `ws.py` (`/ws/jobs/{id}`,
+  `/ws/chat/{package}`), `server.py` (`create_app()`), `__init__.py` (comando `nutcracker dashboard`),
+  `static/index.html` (SPA self-contained: apps, cola, logs en vivo, dispositivo, prompt del agente,
+  chat — sin CDN, dark/light aware).
+- El encolado vía `/api/queue` (`run_now=True`) dispara `engine.drain()` en un hilo de fondo
+  (no bloquea la respuesta HTTP — un job real puede tardar minutos) — el progreso se sigue por WS.
+
+**Bug real encontrado y corregido (crítico, no de este plugin):** `.gitignore` tenía una regla
+`plugins/` sin anclar que también atrapaba `nutcracker_core/plugins/` — el directorio del **sistema
+de plugins del core**, no solo plugins externos. Cualquier plugin de primera parte nuevo (como este
+dashboard) quedaba invisible para git por completo (`git add -A` lo saltea en silencio, sin error).
+Confirmado que el usuario ya había comiteado Fases 1 y 2 en commits separados (`053b4e4 "fase 1"`,
+`23052d0 "Fase 2"`) — de seguir el mismo patrón para Fase 3, todo este plugin se habría perdido
+silenciosamente. Corregido reestructurando la regla a `nutcracker_core/plugins/*` +
+allow-list explícito de los plugins de primera parte (`aireview`, `dashboard`), preservando el
+comportamiento original para plugins externos (siguen ignorados por defecto; `aipwn` además queda
+protegido por tener su propio `.git` anidado, con o sin esta regla). Un efecto secundario de la
+negación (reincluía también `__pycache__/` dentro de esos plugins) se corrigió reforzando esa regla
+al final del archivo. Verificado con `git check-ignore` y `git add -A --dry-run`: los 12 archivos
+nuevos del plugin dashboard ahora sí quedan listos para `git add`.
+
+**Tests:** 24 nuevos (`tests/dashboard/test_events.py` ×6, `test_api.py` ×10 vía FastAPI TestClient
+sin red real, `test_ws.py` ×4 vía `websocket_connect`, más 2 en `tests/test_queue_engine.py` para el
+streaming). Se encontró y corrigió un problema de aislamiento entre tests propio: un test que dispara
+`run_now=True` dejaba un hilo de fondo corriendo tras terminar la función de test, contaminando el
+monkeypatch de `subprocess.run` de un test posterior (flakiness dependiente de timing/orden) —
+arreglado esperando explícitamente a que el hilo de fondo termine antes de que el test retorne. Suite
+completa estable en 3 corridas consecutivas: **95/95 passing**.
+
+**POC real ejecutada** (no simulada): `nutcracker dashboard --config ... --port 8765 --no-scheduler`
+levantado como proceso real; un cliente Python (`httpx` + `websockets`) encoló el mismo APK real de
+Mobile Hacking Lab vía `POST /api/queue`, se conectó a `/ws/jobs/{id}` *antes* de que terminara el
+análisis, y recibió **282 líneas de log reales en vivo** (banner, tabla de vulnerabilidades, tabla
+MASVS completa) seguidas del evento de estado final. Tras terminar: `GET /api/apps` mostró el
+resultado real (`protected`, score 80, grade B, `next_due_at` auto-agendado a 30 días — Fase 1);
+`GET /api/runs/{id}` mostró el finding `AUTH001` con **MASVS-STORAGE-2 + MASWE-0001 + CWE-532**
+completos (Fase 2, fluyendo íntegro por la API del dashboard); `GET /api/device` y
+`/api/device/screenshot` se degradaron correctamente a "sin dispositivo" (503); `GET /api/agent/prompt`
+reportó honestamente `available: false` (el plugin aipwn no tiene sus dependencias — `any-llm-sdk` —
+instaladas en este entorno, nunca se llegó a invocar `nutcracker aipwn <pkg>` de verdad, solo
+`--help`, que no dispara el auto-install del plugin loader).
 
 ---
 
