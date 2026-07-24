@@ -62,7 +62,7 @@ Revisión del commit `90fad34 "advance"` (posterior al commit del plan) contra e
 |---|---|
 | **Fase 0** — Fundamentos + persistencia | ✅ **Completa** (con 2 huecos menores, ver abajo) |
 | **Fase 1** — Cola + scheduler | ✅ **Completa** (POC verificada con APK real, ver abajo) |
-| **Fase 2** — OWASP MAS | ❌ No iniciada |
+| **Fase 2** — OWASP MAS | ✅ **Completa** (investigación real + bugs de mapeo corregidos, ver abajo) |
 | **Fase 3** — Dashboard web | ❌ No iniciada |
 
 ### Fase 0 — detalle de lo entregado
@@ -310,6 +310,102 @@ al estilo del loader de plugins:
 Implementar la separación **verdicto estático vs bypass dinámico** ya especificada en
 `ROADMAP.md` (`aipwn_bypass_confirmed` en `AnalysisResult`, ajuste en `build_masvs_report`),
 que encaja naturalmente con el modelo `runs.kind` de Fase 0.
+
+### Fase 2 — estado: ✅ completa (2026-07-24)
+
+**Investigación previa a implementar** (obligatoria dado el riesgo de inventar datos de un
+estándar): se extrajeron los **24 controles MASVS v2.1 reales** (8 categorías, incluyendo
+PRIVACY) y el **catálogo completo de 119 debilidades MASWE** directamente de
+`mas.owasp.org/MASVS/`, `github.com/OWASP/masvs` (`OWASP_MASVS.yaml`, fuente estructurada de
+verdad) y `github.com/OWASP/maswe` — no se inventó ningún ID ni texto de control.
+
+**Hallazgo central: el repo tenía 3 bugs reales de mapeo MASVS**, encontrados al contrastar
+el código contra el texto oficial de cada control (no eran solo "faltaban campos", eran
+mapeos **incorrectos**):
+1. **RESILIENCE-2 ↔ RESILIENCE-4 invertidos.** El texto oficial de R2 es "anti-tampering"
+   (firma del paquete, integridad DEX/nativo/recursos) y R4 es "anti-dynamic-analysis"
+   (debugger, Frida, hooking) — el código tenía exactamente al revés. Afectaba
+   `DETECTOR_TO_MASVS` ("APK signature verification" → R4 en vez de R2; detección de Frida →
+   R2 en vez de R4) y `RULE_TO_MASVS` (NAT003, anti-debug nativo → R2 en vez de R4).
+2. **AUTH001/DBG002/DBG003/INFO001 en controles cuyo texto oficial no aplicaba.** "Token en
+   logs" estaba en `MASVS-AUTH-2` (cuyo texto real es autenticación local biométrica/PIN, no
+   logs) y `android:debuggable=true` estaba en `MASVS-CODE-2` (cuyo texto real es "mecanismo
+   de actualización forzada", no debuggable). El catálogo MASWE oficial resolvió la duda:
+   `MASWE-0001` ("Insertion of Sensitive Data into Logs") está catalogada bajo **STORAGE**, y
+   `MASWE-0067` ("Debuggable Flag Not Disabled") está catalogada bajo **RESILIENCE** → movidas
+   a `MASVS-STORAGE-2` y `MASVS-RESILIENCE-4` respectivamente (ambas además calzan con el
+   texto oficial de esos controles, que mencionan "logs" y "anti-dynamic-analysis" de forma
+   explícita).
+3. **`COMP008` (ContentProvider exportado) no tenía ningún mapeo MASVS/MASWE/CWE** — se
+   generaba en runtime (`vuln_scanner.scan_manifest_components`) pero nunca se agregó a
+   `masvs.py` cuando se creó la regla.
+
+También se corrigió un **bug de implementación** encontrado por los tests del framework
+nuevo (no de mapeo, de código): los 8 checks adaptados desde `analyzer.ALL_DETECTORS`
+resolvían su metadata MASVS consultando `RULE_TO_MASVS` (por rule_id) en vez de
+`DETECTOR_TO_MASVS` (por nombre de detector) — un dict distinto —, dejando **toda** la
+metadata de los detectores de resiliencia vacía. Detectado por
+`test_static_adapter_wraps_all_existing_rules` al generar `docs/owasp-mas-coverage.md` y ver
+`MASVS-RESILIENCE-1` casi sin checks listados pese a tener 5 detectores activos.
+
+**Entregado:**
+- `masvs.py` reescrito: 24 controles reales + `MASWE_CATALOG` (119 entradas) + `RULE_TO_MASWE`
+  + `RULE_TO_CWE` (mapeo prudente: solo reglas con correspondencia semántica clara y
+  verificable contra el catálogo oficial — no se forzó un MASWE/CWE para reglas ambiguas como
+  HC007/HC008/ST006/OBF001/NAT001/NAT006/NAT007, que se dejaron sin esa dimensión antes que
+  inventar una).
+- `store/hooks.py`: cada `finding` persistido ahora trae `masvs` + `maswe` + `cwe` (los
+  campos ya existían en el schema desde Fase 0 pero nunca se poblaban). Verificado con APK
+  real: `AUTH001|high|MASVS-STORAGE-2|MASWE-0001|CWE-532`.
+- `nutcracker_core/checks/`: framework unificado (`base.py`, `registry.py`) +
+  `checks/static/adapter.py` (envuelve los ~54 checks existentes de
+  `vuln_scanner.RULES`/`EXPORTED_COMPONENT_RULES`/`native_scanner._NATIVE_RULES`/
+  `analyzer.ALL_DETECTORS` sin reescribirlos — riesgo/beneficio de portar ~50 reglas maduras a
+  archivos individuales no lo justificaba) + `checks/dynamic/` con **2 checks dinámicos reales
+  y testeados** (no simulados): `DebuggableDynamicCheck` (confirma `debuggable` en runtime vía
+  `run-as`/JDWP) y `CleartextTrafficDynamicCheck` (detecta HTTP en claro en logcat durante la
+  ejecución) — ambos con un `adb_run` inyectable, así que corren deterministas en CI sin
+  dispositivo. Se hizo un pequeño refactor seguro en `vuln_scanner.py`: `component_tags` (dict
+  local dentro de `scan_manifest_components`) se elevó a constante de módulo
+  `EXPORTED_COMPONENT_RULES` para que el adaptador la reuse sin duplicarla.
+- `docs/owasp-mas-coverage.md`, generado por `tools/gen_owasp_coverage.py` desde el registry
+  (no escrito a mano — regenerar tras cualquier cambio en `masvs.py`/checks). Resultado
+  honesto: **14/24 controles MASVS con al menos un check**; los 10 sin cobertura
+  (AUTH-1/2/3, CRYPTO-2, CODE-1/2/3, PRIVACY-2/3/4) quedan listados explícitamente como gap,
+  no ocultos.
+- ROADMAP "Differentiate runtime bypass vs DEX extraction": `AnalysisResult.aipwn_bypass_confirmed`
+  (nuevo campo, con roundtrip en `to_dict`/`from_dict`); `build_masvs_report()` ahora usa
+  `analysis.protection_broken or analysis.aipwn_bypass_confirmed`; banner de terminal nuevo
+  ("BYPASS CONFIRMED" / i18n EN+ES) en `orchestrator._print_verdict` cuando el bypass viene de
+  aipwn sin extracción de DEX. **Nota importante:** `nutcracker_core/plugins/aipwn/` es un
+  **repositorio git separado** (remoto propio `github.com/nutcracker-sh/aipwn`, invisible al
+  `git status` de este repo) — la parte de wiring en `plugins/aipwn/__init__.py` (marca
+  `aipwn_bypass_confirmed=True` y re-guarda el JSON tras un `report_success`) quedó modificada
+  ahí y **no se comiteó** (fuera del alcance de este repo; coordinar con el mantenedor de ese
+  repo aparte si se quiere subir).
+- Actualización de la sección "PDF report con sección de dynamic analysis" (punto 3 del item
+  de ROADMAP) — **diferida**: el banner de terminal y el campo/score ya distinguen ambos
+  verdictos; el rediseño de la sección PDF es un cambio de mayor superficie en
+  `pdf_reporter.py` que se deja como follow-up explícito, no reclamado como hecho.
+
+**Deliberadamente fuera de alcance de esta fase** (para no sobre-extender el ya considerable
+trabajo de investigación + implementación):
+- Migrar cada regla existente a un archivo `.py` individual dentro de `checks/static/` (el
+  adaptador cubre la meta de "registry unificado" sin ese riesgo/costo).
+- MASWE a nivel de `MISCONFIG_TO_MASVS` (hallazgos del manifest): se corrigieron los IDs
+  MASVS incorrectos ahí, pero no se añadió una dimensión MASWE porque esos hallazgos no pasan
+  hoy por `store/hooks.py::_to_finding_record` (no se persisten en la tabla `findings`) —
+  extenderlo requeriría antes persistir misconfigs, que es un cambio de alcance mayor.
+- Checks dinámicos adicionales más allá de los 2 implementados (debuggable, cleartext) —
+  quedan como candidatos naturales para portar más lógica de
+  `plugins/aipwn/exploit_agent.py` cuando se retome esta fase.
+
+**Tests:** 19 nuevos (`tests/checks/test_registry.py` ×8, `tests/checks/test_dynamic_checks.py`
+×7, `tests/test_masvs_bypass.py` ×4). Suite completa: **73/73 passing**. Verificado también
+con el mismo APK real de Mobile Hacking Lab usado en la POC de Fase 1: coverage pasó de
+15/24 a **24/24** controles reportados, `MASVS-STORAGE-2` ahora captura correctamente el
+finding `AUTH001` (antes atado a un `AUTH-2` cuyo texto oficial no aplicaba), y
+`MASVS-PRIVACY-1`/`MASVS-RESILIENCE-2` pasan a tener veredicto real (antes vacíos).
 
 ---
 
