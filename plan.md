@@ -1082,14 +1082,14 @@ webadb.com/scrcpy?")** que llevó a una investigación de rendimiento real:
 Tests: +2 en `tests/dashboard/test_scrcpy_video.py` (seek cerca del final cuando `container.duration`
 lo permite; fallback a decode completo si el seek lanza excepción). **169/169 tests pasan.**
 
-## Fase 4 (propuesta, no implementada) — video realmente fluido vía WebUSB + WebCodecs
+## Fase 4 — video realmente fluido vía WebUSB + WebCodecs (2026-07-27)
 
 El usuario preguntó por qué el video no es tan fluido como
-[app.webadb.com](https://app.webadb.com) y si se podía replicar ese enfoque. Investigado y
-**confirmado técnicamente factible** (verificado contra la documentación real del proyecto, no
-contra el primer texto pegado por el usuario — algunos nombres de paquete ahí ya estaban
-desactualizados). Se documenta aquí como plan concreto, **sin implementar todavía** — es un cambio
-de arquitectura real (primer build step de JS del proyecto), no un ajuste rápido.
+[app.webadb.com](https://app.webadb.com) y si se podía replicar ese enfoque. Investigado,
+**confirmado técnicamente factible**, y luego **implementado** a pedido explícito del usuario
+("Implementa la fase 4"). Ver más abajo ("Implementación real") para el detalle de qué se
+construyó y cómo se verificó — la sección original de investigación queda tal cual, como
+referencia de las decisiones tomadas.
 
 ### Qué es y por qué sería mejor
 app.webadb.com usa **Tango** (antes `ya-webadb`, de yume-chan) — una reimplementación completa y
@@ -1153,8 +1153,108 @@ problemático en la investigación de "scrcpy real" de más arriba). Documentaci
   que el WebUSB del navegador puede reclamar el device sin conflicto con `adb`/`scrcpy` del
   sistema, y medir el fps real resultante contra la promesa de fluidez.
 
-**Estado: documentado y factible, no implementado.** Requiere decisión explícita del usuario para
-proceder (introduce Node/npm al proyecto por primera vez) antes de escribir código.
+### Implementación real (2026-07-27)
+
+**Investigación de API sin adivinar:** en vez de confiar en resúmenes de la documentación web
+(`tangoadb.dev` — el `WebFetch` la resume con un modelo intermedio, con pérdida real de detalle:
+varias veces devolvió "esta página no incluye el código completo"), se instalaron los paquetes
+reales (`npm install`) y se leyeron directamente sus archivos `.d.ts` — la fuente de verdad exacta.
+De ahí salió la API real completa: `AdbDaemonWebUsbDeviceManager.BROWSER.requestDevice()` →
+`device.connect()` → `AdbDaemonTransport.authenticate({serial, connection, credentialStore})` →
+`new Adb(transport)` → `AdbScrcpyClient.pushServer()` + `AdbScrcpyClient.start()` →
+`client.videoStream` → `WebCodecsVideoDecoder` + `WebGLVideoFrameRenderer` sobre un `<canvas>`.
+
+**Nuevo subproyecto:** `nutcracker_core/plugins/dashboard/webusb/` (npm + TypeScript + Vite —
+primer build de JS del proyecto, tal como se documentó como trade-off arriba). Ver su propio
+`README.md` para el detalle de build/verificación. Resumen:
+- `src/main.ts`: `isSupported()` (feature-detect `navigator.usb` + `AdbDaemonWebUsbDeviceManager.BROWSER`
+  + `WebCodecsVideoDecoder.isSupported`) y `connect(canvas, onStatus)` implementando el flujo
+  completo de arriba. Sin control táctil en esta primera versión (`control: false`) — solo video.
+- **El typecheck (`tsc --noEmit` contra los tipos reales) encontró y forzó a arreglar 2 bugs reales**
+  antes de siquiera correr nada: un `ReadableStream` nativo del DOM no es estructuralmente
+  idéntico al `ReadableStream` propio de `@yume-chan/stream-extra` que `pushServer()` espera
+  (difieren en el tipo resuelto de `.closed`) — hubo que importar su implementación explícitamente
+  en vez de asumir compatibilidad con la global del navegador.
+- **El binario real del scrcpy-server (v3.3.1, descargado en build-time desde GitHub Releases de
+  Genymobile vía `@yume-chan/fetch-scrcpy-server`, sin vendorear nada) queda embebido como data URI
+  dentro del bundle final** — Vite detecta automáticamente el patrón `new URL(..., import.meta.url)`
+  del paquete y lo inlinea. Verificado **byte a byte**: los 90.788 bytes decodificados del bundle
+  coinciden exactamente con el `server.bin` descargado. Un solo archivo `.js` (~290KB, +un chunk de
+  worker de ~174KB) sirve todo — sin archivos `.bin` sueltos que gestionar ni versionar aparte.
+- **Fricción de entorno real, resuelta (y reconfirmada por el usuario en su propio WSL):** `npm`/
+  `node` en WSL a veces resuelven al `node.exe`/`npm.cmd` de Windows vía interop — funcionaba para
+  `npm install` en este agente, pero **Vite fallaba resolviendo su propio paquete** al cruzar el
+  path UNC `\\wsl.localhost\...`. Se resolvió descargando un Node.js Linux nativo
+  (`nodejs.org/dist`, tarball, sin necesitar root) y usándolo en vez del `node.exe` de Windows para
+  todo el toolchain — evita el cruce de filesystem por completo. **El usuario pegó exactamente este
+  mismo problema al correr `npm install && npm run build` en su propio WSL** (`npm warn cleanup
+  ... EISDIR` limpiando `node_modules`, luego `vite build` con
+  `CMD.EXE ... No se permiten rutas UNC`) — confirma que no era una rareza de este entorno aislado
+  sino un problema real y reproducible para cualquiera con Node solo instalado en Windows. Se
+  documentó el fix (instalar Node nativo vía `nvm` dentro de WSL) de forma prominente en
+  `webusb/README.md`, con el error exacto para que sea buscable.
+- **Frontend (`index.html`):** nuevo botón "🔌 USB directo (fluido)" en la pestaña Dispositivo,
+  visible solo si `isSupported()` da `true` (import dinámico perezoso del bundle, `await
+  import("/static/webusb-video.bundle.js")` — si el archivo no existe porque nadie corrió `npm run
+  build`, falla en silencio y el botón simplemente no aparece, cero impacto para quien no lo usa).
+  Nuevo `<canvas id="webusb-canvas">` junto al `<img id="shot">` existente — se togglea cuál está
+  visible según el modo activo (WebUSB / scrcpy_video.py / polling), solo una fuente de video a la
+  vez.
+
+**Validado en un navegador real (Playwright, Chromium headless):** `navigator.usb` presente, el
+módulo se importa sin errores, `isSupported()` devuelve `true`, el botón aparece correctamente,
+layout limpio (captura real revisada).
+
+### Validación en vivo por el usuario contra su Moto G23 real (2026-07-27, post-entrega)
+
+El usuario probó la conexión real de punta a punta desde Chrome/Edge en Windows, con el teléfono
+por USB. Dos problemas reales encontrados y arreglados en el camino, ninguno hipotético:
+
+**🔴 Confirmado el conflicto de exclusividad de USB** (la incógnita explícita de la investigación
+original): primer intento falló con
+`The device is already in used by another program` — el servidor `adb` de Windows (con el que
+scrcpy/frida ya venían trabajando toda la sesión) mantiene una conexión USB persistente al
+teléfono, y WebUSB necesita acceso **exclusivo** — no puede coexistir. Fix: `adb kill-server` desde
+Windows antes de conectar por WebUSB. No hay forma de evitar esto desde el código — es una
+restricción real del modelo de permisos de WebUSB, documentada así en vez de prometer que
+"simplemente funciona" en paralelo con `adb`.
+
+**🔴 Bug real de código encontrado y arreglado — `WebGLVideoFrameRenderer` sin fallback.**
+Tras resolver el conflicto de USB, la conexión avanzó mucho más lejos (autenticación, push del
+server, arranque de scrcpy, stream de video) y falló recién al crear el renderer:
+`WebGL not supported` — en una máquina Windows normal, no una VM ni nada exótico (WebGL puede
+fallar por aceleración de hardware deshabilitada en el navegador, drivers de GPU, políticas
+empresariales, etc. — no es raro en la práctica). El código original solo usaba
+`WebGLVideoFrameRenderer` sin condicional. Fix: `WebGLVideoFrameRenderer.isSupported` (el getter
+estático que ya existía en el paquete, sin usar) decide entre WebGL y `BitmapVideoFrameRenderer`
+(canvas 2D + `createImageBitmap`, más lento pero sin dependencia de WebGL) — mismo patrón de
+degradación honesta que el resto del proyecto. Recompilado y re-typechecked limpio
+(`npm run check` + `vite build`, bundle 293.62KB → 293.95KB).
+
+Ambos hallazgos vinieron de probar contra hardware/software real, no de imaginar casos borde —
+exactamente el patrón que se repitió durante toda la sesión con `scrcpy_video.py` y el resto del
+dashboard: el código que parece correcto en el papel (y pasa el typecheck) sigue topándose con
+comportamiento real del sistema operativo/navegador que solo aparece al usarlo de verdad.
+
+**✅ Confirmado funcionando por el usuario, con video real:** tras el fix del renderer, la conexión
+mostró la pantalla real del Moto G23 (launcher con apps reales) dentro del `<canvas>` — captura
+real revisada. **Fase 4 queda validada de punta a punta contra hardware físico real**, no solo con
+mocks/Playwright headless.
+
+**🟡 Bug de CSS encontrado y arreglado en el mismo intercambio** — la imagen se veía distorsionada
+(estirada horizontalmente). Causa: `#webusb-canvas` tenía `width:100%; max-height:70vh` pero **sin
+`object-fit:contain`** (a diferencia de `#shot`, que sí lo tenía desde el fix de UX anterior) —
+sin eso, cuando `max-height` recorta la altura, el ancho no se reduce en proporción y la imagen se
+deforma. Fix de una línea en `index.html` (agregar `height:auto; object-fit:contain`) — **no
+requiere recompilar el bundle de npm**, es CSS puro del HTML servido directamente. Verificado con
+un canvas de prueba a la proporción real de un teléfono (720×1600): un círculo dibujado se ve
+círculo perfecto, no óvalo, con las barras de letterboxing correctas a los costados (captura real
+revisada, no solo razonado).
+
+Sin tests de Python nuevos (este es código TypeScript/CSS que corre 100% en el navegador, fuera del
+alcance de `pytest`) — la verificación es el typecheck + build + Playwright + la validación en vivo
+del usuario, dos veces (conexión real, luego el fix visual). **181/181 tests de Python siguen
+pasando** (sin cambios en el backend) en cada paso.
 
 ## Fix: "re-analizar" fallaba para apps analizadas desde un .apk local (2026-07-27)
 
