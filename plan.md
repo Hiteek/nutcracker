@@ -1302,3 +1302,102 @@ Tests: 2 en `tests/test_store_hooks.py` (con/sin `NUTCRACKER_APK_SOURCE` en el e
 `tests/test_orchestrator.py` (`_run_analysis` fija/limpia la env var según `keep_apk`, con todas
 las dependencias pesadas mockeadas — `APKAnalyzer`, `_post_analysis_flow`,
 `save_analysis_json`, `fire_post_hooks`, etc.). **181/181 tests pasan.**
+
+## Feature: batch estático+aipwn desde un .txt, con fuente de APK elegible (2026-07-27)
+
+Pedido del usuario: programar en cola varios escaneos estáticos + aipwn desde un archivo `.txt`
+con package ids, pudiendo elegir si el `.apk` de cada uno se descarga de una store o se extrae del
+ya instalado en el dispositivo conectado. Confirmado con el usuario vía `AskUserQuestion`: (1) todo
+package del archivo recibe **siempre** estático + aipwn encadenado (no control mixto por línea), y
+(2) la elección de fuente device-vs-descarga es un **flag global** para todo el archivo, no por app.
+
+**Diseño:** reusa 100% la infraestructura existente en vez de construir un motor nuevo —
+`QueueEngine.drain(on_result=...)` ya notifica cada job terminado; basta con acumular los packages
+cuyo job estático terminó OK y llamar `engine.submit(pkg, kind="aipwn", ...)` + un segundo
+`drain()` tras el primero (el patrón multi-`drain()` ya lo ejercitaba
+`test_drain_picks_up_jobs_queued_by_a_different_engine_instance`, así que no era terreno nuevo).
+
+**Cambios:**
+- `downloader.py`: nueva clase `DeviceInstalledDownloader` — `adb shell pm path <pkg>` (soporta App
+  Bundle con varios splits) + `adb pull` de cada uno a `downloads/<pkg>/`, identificando `base.apk`
+  como el archivo principal. `download_apk_from_config()` gana un branch `source == "device"` y un
+  parámetro `serial` que dispatchea a esta clase antes de la auto-selección google-play/apk-pure.
+- `cli/scan.py`: `--source` gana la opción `"device"`, nueva opción `--serial` (solo usada con
+  `--source device`).
+- `orchestrator.build_job_cmd()`: nuevo parámetro `source`; en el branch `scan` (target no es un
+  `.apk` local) agrega `--source <source>` y, si `source == "device"`, también `--serial`.
+- `queue/job.py`: `Job.source` — igual que `is_local_apk`, vive solo en memoria (no persiste en
+  SQLite); un job recuperado tras un reinicio del daemon cae a la descarga normal en vez de
+  perderse (documentado en el propio campo).
+- `queue/engine.py`: `QueueEngine.submit(source=...)` lo pasa al `Job` construido; `_run_job()` lo
+  reenvía a `build_job_cmd(source=job.source)`. **Fix encontrado durante la implementación** (no
+  reportado por el usuario, detectado al revisar el código): el heurístico existente
+  `_resolve_local_apk()` (que reutiliza un `.apk` ya en `downloads/<pkg>/` para evitar una descarga
+  repetida) corría *antes* de mirar `job.source` — si el usuario pedía explícitamente
+  `--source device` pero `downloads/<pkg>/` ya tenía un `.apk` de un intento anterior con otra
+  fuente, el pedido explícito se ignoraba en silencio. Fix: el heurístico ahora se salta por
+  completo cuando `job.source` está seteado (un pedido explícito de fuente siempre manda).
+- `cli/queue_cmd.py`: `queue add` gana `--source`/`--serial` (se pasan tal cual a cada
+  `engine.submit()`) y `--then-aipwn` — con `--run`, agrupa el resultado de cada job estático en
+  `pending_aipwn` (dentro de `on_result`, solo si `kind == "static"` y `ok` y hay `package`), y tras
+  el primer `drain()` encola un job `aipwn` por cada uno y hace un segundo `drain()`. Rechaza
+  combinarse con `--dynamic`/`--aipwn` (son kinds de job distintos al estático que `--then-aipwn`
+  asume como base).
+
+Uso: `nutcracker queue add packages.txt --then-aipwn --source device --serial <serial> --run`.
+
+Tests nuevos (16, **197/197 pasan** en total): `tests/test_downloader_device.py`
+(`DeviceInstalledDownloader` — split de App Bundle, package no instalado, adb ausente, `pull`
+fallido, dispatch desde `download_apk_from_config`), 4 en `test_orchestrator.py` (`--source`/
+`--serial` en el cmd de `scan`, ausentes cuando no aplica, ignorado en el branch `analyze`), 2 en
+`test_queue_engine.py` (`source` llega al cmd construido, y el fix del heurístico de reuso de APK
+local), 4 en `test_queue_cmd.py` (encadena aipwn tras estático OK, no encadena tras uno fallido,
+rechaza `--then-aipwn --dynamic`, `--source`/`--serial` se propagan a cada `submit()` del archivo).
+Alcance solo CLI (`queue add <archivo.txt> ...`) — el dashboard web no se tocó para esta feature,
+ya que su API REST opera sobre un target a la vez, no sobre un archivo.
+
+## Feature: la misma cola batch, ahora también desde el dashboard (2026-07-27, follow-up)
+
+El usuario preguntó si el batch anterior (estático+aipwn encadenado desde un `.txt`, con fuente de
+`.apk` elegible) se podía disparar también desde el dashboard, no solo por CLI. Confirmado que sí y
+pedido implementarlo.
+
+**Diseño:** reusa la misma lógica de encadenado que `cli/queue_cmd.py` (mismo patrón `submit` →
+`drain(on_result=...)` acumulando packages OK → `submit(kind="aipwn")` por cada uno → segundo
+`drain()`), pero corriéndola en un hilo de fondo — igual que ya hacía `_drain_in_background()` para
+un solo job — en vez de bloquear la respuesta HTTP.
+
+**Cambios:**
+- `plugins/dashboard/api.py`: nuevo `POST /api/queue/batch` (`QueueBatchPayload`: `targets: list[str]`,
+  `source`, `serial`, `then_aipwn: bool = True`). Encola un job estático por cada target (filtrando
+  líneas vacías/`#comentarios`) y lanza `_drain_batch_in_background()`, que replica exactamente la
+  lógica de `queue_cmd.py` (acumula `pending_aipwn` dentro de `on_result`, solo si `kind == "static"`
+  y `ok` y hay `package`; tras el primer `drain()` encola los `aipwn` y hace un segundo `drain()`).
+  Reusa el mismo guard `engine._dashboard_draining` que ya usaba `_drain_in_background()` para el
+  path de un solo job — extraje el publish-a-bus común (`_publish_job_status`) para no duplicarlo
+  entre ambos caminos.
+- `static/index.html`: nuevo bloque "Batch desde archivo" en la tarjeta de cola — `<input
+  type="file" accept=".txt">` + un `<select>` de fuente (store/device) + botón. El archivo se lee
+  100% client-side con `File.text()` y se parte en líneas en JS — no hace falta subir un multipart
+  al backend, el body que viaja es un JSON `{targets: [...], source, serial, then_aipwn: true}`
+  igual que cualquier otro POST del dashboard. El progreso no necesita UI nueva: los jobs (estáticos
+  y luego los `aipwn` encadenados) aparecen solos en la tabla de cola ya existente, que ya hacía
+  polling cada 5s (`refreshQueue()` vía `setInterval(refreshAll, 5000)`).
+
+**Verificación:** 5 tests nuevos en `tests/dashboard/test_api.py` vía `TestClient` (rechaza lista
+vacía, ignora líneas en blanco/comentarios, encadena aipwn tras estático OK — simulando
+`repository.link_job_run` como ya hacía `test_reschedule_sets_next_due_at_after_job_completes` en
+`test_queue_engine.py` para que `outcome.package` quede seteado —, no encadena tras uno fallido,
+`source`/`serial` llegan a cada `submit()` vía un spy). **202/202 tests pasan.**
+
+Además, verificación en vivo (no solo mocks): arrancado `nutcracker dashboard` de verdad contra un
+`config.yaml` aislado en el scratchpad (`store.db_path` propio, nunca toca la `nutcracker.db` real
+del usuario — mismo cuidado que en la sesión de Fase 4/WebUSB) y golpeado `POST /api/queue/batch`
+por HTTP real dos veces: una con un package inexistente (fuente store, termina en `error` con el
+mensaje esperado "APK no encontrada tras la descarga") y otra con `source=device` sin ningún
+dispositivo conectado (termina en `error` con "no está instalado en el dispositivo", confirmando
+que el branch `DeviceInstalledDownloader` se ejecuta de verdad). Confirma que el wiring
+HTTP→QueueEngine→subprocess→SQLite funciona end-to-end, no solo bajo `TestClient`. No se pudo
+probar el click real en el navegador (sin herramienta de automatización de navegador disponible en
+esta sesión) — el HTML servido sí se verificó (`curl` confirma que `batch-file`/`batch-source`/
+`runBatch()` están presentes en la página).
