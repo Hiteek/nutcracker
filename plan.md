@@ -1401,3 +1401,115 @@ HTTP→QueueEngine→subprocess→SQLite funciona end-to-end, no solo bajo `Test
 probar el click real en el navegador (sin herramienta de automatización de navegador disponible en
 esta sesión) — el HTML servido sí se verificó (`curl` confirma que `batch-file`/`batch-source`/
 `runBatch()` están presentes en la página).
+
+## Reimplementación completa del dashboard tras pérdida del plugin (2026-07-27)
+
+`nutcracker_core/plugins/dashboard/` desapareció por completo del disco entre sesiones (la carpeta
+está gitignoreada a propósito — regla `plugins/` sin anclar, ver nota de Fase 3 — así que nunca
+estuvo en git; se perdió por algún motivo ajeno a git, no identificado). Se reconstruyó desde cero
+usando este mismo documento (Fases 3/4 más arriba) y los tests ya existentes (`tests/dashboard/*.py`,
+escritos contra la implementación anterior) como especificación ejecutable: `events.py`,
+`store_reader.py`, `device.py`, `chat_mailbox.py`, `scrcpy_video.py`, `api.py`, `ws.py`, `server.py`,
+`__init__.py` (comando `nutcracker dashboard`), `static/index.html`, y el subproyecto
+`webusb/` completo (instalado, typechequeado contra los `.d.ts` reales — encontró y corrigió 7
+desajustes de API respecto a lo escrito de memoria — y compilado: bundle real de 315KB + worker de
+173KB, con el `scrcpy-server` v3.3.1 embebido verificado byte a byte). Node.js nativo se instaló en
+WSL para esto (evitando el `node.exe`/`npm.cmd` de Windows vía interop, misma fricción ya
+documentada en Fase 4). 202/202 tests de Python vuelven a pasar.
+
+Dos bugs reales encontrados y arreglados durante la reconstrucción, ambos por reporte directo del
+usuario contra el dashboard real corriendo:
+- **`connectWebUsb()` sin manejo de errores**: cualquier fallo de la cadena WebUSB (el más común:
+  conflicto de exclusividad USB con `adb`, ya documentado en Fase 4) quedaba como unhandled
+  promise rejection — el canvas se veía en blanco sin ningún mensaje visible. Fix: try/catch en
+  `main.ts` (con detección específica del mensaje "already in used" para sugerir `adb kill-server`)
+  y en `connectWebUsb()` como defensa adicional, restaurando la vista de polling si falla.
+- **`multipart/x-mixed-replace` en `<img src>` poco confiable en Chrome/Edge**: el backend
+  producía frames JPEG válidos (confirmado con `curl`/`requests` reales), pero Chrome no
+  re-renderizaba el `<img>` con cada parte nueva — reportado como "no se ve nada". Fix: parsear el
+  stream a mano vía `fetch()` + `ReadableStream`, actualizando `<img>` con un Blob URL por frame.
+
+### Eliminación de "Video en vivo (scrcpy)" a pedido del usuario (2026-07-27)
+
+El usuario pidió explícitamente sacar el modo de video basado en archivo (`scrcpy_video.py`:
+`scrcpy --no-window --record=<mkv>` + PyAV releyendo el archivo, ~1-2fps) y dejar únicamente el
+modo fluido (WebUSB + WebCodecs, Fase 4) más el polling de screenshots existente como fallback
+universal. Justificación implícita: el modo scrcpy-archivo también arrancaba automáticamente al
+abrir la pestaña "Dispositivo" (otro fix de esta misma sesión, antes de esta eliminación) y quedó
+redundante frente a WebUSB para quien ya tiene un navegador Chromium — y añadía una dependencia
+pesada (PyAV/`av`) y una superficie de bugs (huérfanos de `scrcpy` en el device, fps limitado) que
+ya no aportaba nada que WebUSB o el polling no cubrieran mejor.
+
+**Eliminado:** `nutcracker_core/plugins/dashboard/scrcpy_video.py` (módulo completo),
+`tests/dashboard/test_scrcpy_video.py`, los endpoints `GET /api/device/video` y
+`GET /api/device/video/status` (`api.py`), sus 3 tests en `test_api.py`, el botón "▶ Video en vivo
+(scrcpy)" y las funciones `toggleDeviceView()`/`streamMjpeg()`/`_findCRLFCRLF()` (`index.html`),
+`dashboard.scrcpy_path` de `config.yaml`/`config.yaml.example`, la dependencia `av>=11.0`
+(`requirements.txt` del plugin y el extra `[dashboard]` de `pyproject.toml`), y las secciones
+correspondientes de `README.md`. `create_app()`/`create_router()` perdieron el parámetro `config`
+(ya no lo necesita ningún endpoint).
+
+**Sin tocar:** el modo WebUSB (Fase 4) y el polling de screenshots (`/api/device`,
+`/api/device/screenshot`) quedan exactamente igual — la pestaña "Dispositivo" ahora solo tiene esos
+dos modos, con WebUSB 100% opt-in vía su botón.
+
+Suite completa vuelta a correr tras la eliminación (ver más abajo en la sesión) para confirmar que
+nada quedó roto.
+
+### Eliminación también del polling de screenshots (2026-07-27, mismo día)
+
+El usuario pidió sacar también el fallback de polling de screenshots (`GET /api/device`,
+`GET /api/device/screenshot`, `device.py`) y dejar el tab "Dispositivo" con **únicamente** el modo
+WebUSB ("🔌 USB directo (fluido)") — sin ningún fallback de video/captura vía `adb`.
+
+**Eliminado:** `nutcracker_core/plugins/dashboard/device.py` (módulo completo — `list_serials()`,
+`screenshot_png()`), los endpoints `GET /api/device` y `GET /api/device/screenshot` (`api.py`), sus
+2 tests en `test_api.py`, el selector de serial (`<select id="device-serial">` + botón "Refrescar
+seriales"), el `<img id="shot">`, y las funciones `refreshDevices()`/`pollScreenshot()` de
+`index.html`. El tab "Dispositivo" ahora solo tiene el botón WebUSB + el `<canvas>`; sin bundle
+compilado o sin soporte del navegador, el botón simplemente no aparece y el status lo indica
+explícitamente (sin fallback silencioso a ningún otro modo).
+
+Verificado contra el dashboard real reiniciado con el código nuevo: `GET /` → 200, `GET
+/api/summary` → 200, `GET /api/device` → 404 (confirma que se eliminó, no que quedó roto), bundle
+WebUSB sigue sirviéndose bien. Suite completa: **179/179 tests pasan** (181 → 179, los 2 tests de
+`device.py` eliminados junto con el módulo).
+
+## adb-over-Wi-Fi para evitar el conflicto de exclusividad USB con WebUSB (2026-07-27)
+
+El usuario reportó `--source device` fallando en un batch job con `adb.exe: no devices/emulators
+found` al tener WebUSB conectado en el dashboard (conflicto de exclusividad ya documentado en Fase
+4, esta vez en la dirección USB→adb en vez de adb→USB). Propuso — y se implementó — la solución
+estándar: mover `adb` a TCP/IP (`adb tcpip 5555` + `adb connect <ip>:5555`) para que use la red en
+vez del mismo cable USB que WebUSB reclama en exclusiva.
+
+Encontrado en el camino, con uso real: la conexión `adb connect <ip>:puerto` vive en el servidor
+adb local y **no sobrevive un reinicio del daemon** (a diferencia de `adb tcpip` en el propio
+teléfono, que sí persiste) — cualquier reinicio (crash, `adb kill-server`, sleep/wake de Windows)
+deja el serial de red "perdido" hasta reconectar a mano. Peor aún, conectar WebUSB parece
+desestabilizar momentáneamente el propio `adb.exe` de Windows (visto en vivo: "could not read ok
+from ADB Server", "failed to start daemon", "cannot connect to daemon" — errores *transitorios*
+del daemon, no del device/paquete, que se resuelven solos en 1-2s).
+
+**Fix en `downloader.py`** (`DeviceInstalledDownloader`, usado por `--source device`):
+- `_ensure_network_serial_connected()` — si el serial tiene forma `host:puerto`, corre `adb
+  connect` antes de cualquier `pm path`/`pull` (idempotente, no rompe nada si ya estaba
+  conectado). No-op para seriales USB normales.
+- `_is_daemon_transient_error()` — detecta los 4 patrones de falla transitoria del daemon listados
+  arriba.
+- `_run_adb()` — envuelve cada invocación de `adb` (connect, pm path, pull) con hasta 3 reintentos
+  (pausa de 1.5s) cuando la salida matchea un error transitorio del daemon, en vez de abortar el
+  job entero por un problema que se resuelve solo.
+
+Documentado para el usuario: usar la IP:puerto del teléfono (no el serial USB) como `--serial` al
+correr batch/queue con `--source device` mientras WebUSB está conectado.
+
+**Limpieza de la cola**: a pedido del usuario, se vació `queue_jobs` (2736 filas acumuladas de
+pruebas repetidas, 2566 en estado `queued`) vía SQL directo — confirmado explícitamente con el
+usuario que el alcance era solo la cola, sin tocar `apps`/`runs`/`findings`/`schedule` (historial
+real de análisis de apps bancarias reales del usuario).
+
+Tests nuevos (6, `tests/test_downloader_device.py`): detección de los 4 marcadores de error
+transitorio, no-op para seriales USB, `adb connect` disparado para seriales `ip:puerto`,
+reintentos ante falla transitoria (tanto en `_ensure_network_serial_connected` como en el propio
+`pm path` de `download()`). **187/187 tests pasan.**
