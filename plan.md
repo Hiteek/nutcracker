@@ -1155,3 +1155,50 @@ problemático en la investigación de "scrcpy real" de más arriba). Documentaci
 
 **Estado: documentado y factible, no implementado.** Requiere decisión explícita del usuario para
 proceder (introduce Node/npm al proyecto por primera vez) antes de escribir código.
+
+## Fix: "re-analizar" fallaba para apps analizadas desde un .apk local (2026-07-27)
+
+El usuario reportó, al usar el dashboard real: clic en "re-analizar" para `sh.nutcracker.nutbank`
+(su propia app de prueba, no una app bancaria real) devolvía
+`Download error: APK no encontrada en 'downloads' tras la descarga`.
+
+**Causa raíz:** `reQueue(pkg)` en el frontend siempre reencola usando el **package id** como
+target. Cuando el target no es una ruta local (`_is_local_apk()` da False), `build_job_cmd` arma
+un job `scan <package>`, que intenta *descargar* la app desde Google Play/APKPure. Esto funciona
+para apps reales publicadas en una store, pero `sh.nutcracker.nutbank` es la app de demo propia del
+usuario (`downloads/nutbank.apk`, analizada originalmente vía `analyze <ruta-local>`) — nunca
+estuvo publicada en ninguna store, así que la re-descarga por package id no puede funcionar nunca,
+sin importar credenciales.
+
+Investigando más a fondo: el esquema de `apps` ya modelaba justo esta distinción
+(`source TEXT -- apkpure | google-play | local | url`, ver `schema.sql`) pero **la columna nunca se
+escribía en ningún lado del código** — un campo muerto desde Fase 0, no algo que esta sesión rompió.
+Sin ese dato, el dashboard no tenía forma de saber "esta app se puede re-analizar desde tal ruta
+local" en vez de "hay que volver a descargarla".
+
+**Fix:**
+- `orchestrator._run_analysis()`: justo antes de disparar el post-hook `after_analysis`, si
+  `keep_apk=True` (el archivo va a seguir existiendo después de esta función) deja la ruta
+  resuelta en la variable de entorno `NUTCRACKER_APK_SOURCE`; si no, la limpia. No se pudo pasar
+  como kwarg directo al hook porque `fire_post_hooks("after_analysis", ...)` comparte firma fija
+  con otros post-hooks (p.ej. `aireview`) que no aceptan kwargs extra — mismo patrón ya usado para
+  `NUTCRACKER_QUEUE_JOB_ID`.
+- `store/hooks.py::_persist_after_analysis()`: si esa env var está presente, llama
+  `repository.upsert_app(conn, package, source=f"local:{ruta}")` (el `UPSERT` de `upsert_app` ya
+  soportaba actualizar `source` en un run posterior, vía `COALESCE(excluded.source, apps.source)`
+  — solo faltaba que alguien lo llamara con un valor real).
+- Frontend (`reQueue()`): si `app.source` empieza con `"local:"`, usa esa ruta como target en vez
+  del package id — la app se re-analiza desde el mismo `.apk` que la primera vez, sin intentar
+  descargar nada.
+- **Dato ya existente corregido a mano** en la `nutcracker.db` real del usuario (no una prueba):
+  `UPDATE apps SET source = 'local:/home/hiteek/nutcracker2/nutcracker/downloads/nutbank.apk'
+  WHERE package = 'sh.nutcracker.nutbank'` — la única fila de `apps` en su base, analizada antes
+  de que este fix existiera, así que "re-analizar" funciona ya mismo sin esperar un ciclo nuevo.
+- **No requiere reiniciar el dashboard**: cada job de la cola corre como subproceso aislado
+  (`python nutcracker.py analyze/scan ...`), que importa el código actualizado desde disco en cada
+  invocación — solo el cambio de frontend necesita recargar la página del navegador.
+
+Tests: 2 en `tests/test_store_hooks.py` (con/sin `NUTCRACKER_APK_SOURCE` en el entorno), 2 en
+`tests/test_orchestrator.py` (`_run_analysis` fija/limpia la env var según `keep_apk`, con todas
+las dependencias pesadas mockeadas — `APKAnalyzer`, `_post_analysis_flow`,
+`save_analysis_json`, `fire_post_hooks`, etc.). **181/181 tests pasan.**
