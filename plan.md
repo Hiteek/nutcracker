@@ -220,14 +220,56 @@ esta fase a la realidad del código):
   siempre a `drain()` (barato si no hay nada pendiente) en vez de solo cuando hay apps
   vencidas — así recoge jobs encolados manualmente entre ticks. Regresión cubierta por
   `tests/test_queue_engine.py::test_drain_picks_up_jobs_queued_by_a_different_engine_instance`.
-- **`batch` NO se migró internamente al motor de cola** (a diferencia de lo previsto en el
-  texto original de 1.3). Se mantiene tal cual (secuencial, in-process, ya probado) por
-  relación riesgo/beneficio: reescribirlo para reconstruir su resumen consolidado
-  (severidades, top findings, categorías) desde SQLite en vez de desde objetos en memoria
-  era un cambio de mayor superficie sin beneficio claro sobre simplemente ofrecer el nuevo
-  camino recomendado (`queue add <list_file>` + `serve`/`--run`), que cubre el mismo
-  entregable (revisión masiva con paralelo/secuencial + reintentable + persistida). Pendiente
-  como mejora futura opcional, no bloqueante.
+- **`batch` migrado al motor de cola** (2026-07-25, ver detalle más abajo — cerraba el único
+  ítem pendiente de Fase 1). Ya no es secuencial/in-process: corre en paralelo según
+  `queue.static_workers`, con resumen consolidado reconstruido desde SQLite.
+
+### `batch` migrado al motor de cola (2026-07-25)
+
+Cerrado el único pendiente de Fase 1. `cli/batch.py` ya no duplica su propio bucle de
+descarga+análisis in-process (`APKAnalyzer` + `_post_analysis_flow` directos, con su propio
+`results_summary` armado en memoria) — ahora cada target pasa por el mismo
+`QueueEngine.submit()`/`drain()` que usan `queue add` y `serve`: subproceso aislado
+(`analyze`/`scan`), paralelo real según `queue.static_workers` (default 4) o estrictamente
+secuencial con `static_workers: 1`.
+
+- **Resumen reconstruido desde SQLite**, no desde objetos en memoria: nueva función
+  `_summary_for_outcome()` en `cli/batch.py` — como cada job corrió en su propio subproceso, no
+  hay `ScanResult` en memoria para armar severidades/top-findings/categorías; se leen de
+  `repository.findings_for_run()` usando el `run_id` que `JobOutcome` ya trae enlazado (Fase 1
+  original). El PDF consolidado (`generate_batch_report`) no cambió — sigue recibiendo la misma
+  forma de `dict` de siempre.
+- **`--stop-on-error` solo se garantiza estrictamente en modo secuencial**
+  (`static_workers: 1`): ahí se encola y drena un target a la vez, cortando antes del
+  siguiente. En paralelo no hay forma de cancelar jobs que el pool ya empezó (QueueEngine no
+  soporta cancelación a mitad de camino) — documentado en el `--help` del comando.
+  `--keep-apk` se eliminó del CLI de `batch`: `build_job_cmd` ya fuerza `--keep-apk` en todo
+  job de tipo `scan` (decisión ya tomada en Fase 1 para depuración), así que el flag propio de
+  `batch` había quedado inalcanzable de todas formas.
+- **Efecto colateral bienvenido**: cada app que pasa por `batch` ahora también queda
+  auto-agendada para revisión periódica (Fase 1.2) — confirmado en la prueba real
+  (`next_due_at` se fijó a 30 días).
+- **Bug preexistente encontrado y arreglado al validar con hardware real (no relacionado con
+  esta migración)**: `generate_batch_report()` crasheaba con `FPDFUnicodeEncodingException` al
+  renderizar el título "Comparative Table — Protection Status" — el em-dash (`—`) no es
+  soportable por la fuente Helvetica no-Unicode que usa fpdf2 para `section_title()`. Bug
+  presente desde antes (mismo string, mismo problema con el `batch` viejo), simplemente nunca
+  se había ejercitado con >1 resultado exitoso en un test real. Fix: reemplazado por un guion
+  simple en `i18n.py` (EN + ES) — único string con em-dash de los 43 que existen en el archivo
+  que efectivamente se usa en `pdf_reporter.py`. Test de regresión:
+  `tests/test_pdf_reporter_batch.py`.
+- **Validado con APKs reales contra el dispositivo físico** (no solo con la QueueEngine
+  mockeada de los tests): 3 targets (2 válidos + 1 corrupto a propósito) en paralelo
+  (`static_workers=3`) → resumen correcto (2 OK, 1 error con el mensaje real "End of central
+  directory record (EOCD) signature not found"), PDF consolidado generado; y en secuencial
+  (`static_workers=1`) con `--stop-on-error` → se detuvo correctamente antes del tercer target
+  tras el error en el segundo.
+
+**Tests:** 9 nuevos (`tests/test_batch.py` — reconstrucción de resumen desde SQLite con
+severidades/leaks/categorías/mapeo de verdicto, más el flujo del comando vía `CliRunner` con
+una `QueueEngine` falsa, incluida la detención en modo secuencial) + 1
+(`tests/test_pdf_reporter_batch.py`, regresión del em-dash). Suite completa: **119/119
+passing**.
 
 **Archivos nuevos:** `nutcracker_core/queue/{__init__,job,engine}.py`,
 `nutcracker_core/scheduler.py`, `nutcracker_core/cli/{serve,queue_cmd,schedule_cmd}.py`,
@@ -407,6 +449,54 @@ con el mismo APK real de Mobile Hacking Lab usado en la POC de Fase 1: coverage 
 finding `AUTH001` (antes atado a un `AUTH-2` cuyo texto oficial no aplicaba), y
 `MASVS-PRIVACY-1`/`MASVS-RESILIENCE-2` pasan a tener veredicto real (antes vacíos).
 
+### Cierre de cobertura OWASP MAS: 14/24 → 18/24 (2026-07-25)
+
+De los 10 controles sin ningún check, se cerraron 4 con checks reales y de alta confianza — el
+resto se dejó **honestamente sin cobertura** en vez de forzar checks de baja confianza solo para
+subir el número (mismo criterio de prudencia que el resto de Fase 2).
+
+- **`MASVS-CODE-1` (versión de plataforma actualizada) — "victoria gratis"**: el check ya
+  existía (`manifest_analyzer.py` detecta `targetSdkVersion` bajo y ya estaba mapeado a CODE-1
+  en `MISCONFIG_TO_MASVS` desde la propia Fase 2), pero no aparecía en el registry/coverage doc
+  porque el adaptador solo envolvía `vuln_scanner`/`native_scanner`/detectores. Nueva función
+  `_load_manifest_analyzer_checks()` en `checks/static/adapter.py` lo representa con un id
+  sintético `MANIFEST-LOW-TARGET-SDK` (no es un `VulnRule` real — no aparece en hallazgos
+  persistidos, esos `Misconfiguration` no pasan por `store/hooks.py` hoy, mismo gap ya
+  documentado arriba).
+- **`MASVS-CRYPTO-2` (gestión de claves)** — `CRYPTO007`: detecta `SecretKeySpec` construido
+  directamente desde los bytes de un password/PIN (`getBytes()`), sin una función de derivación
+  de claves. Patrón real y específico (exige que el nombre de variable contenga
+  password/passwd/pin/secret), bajo riesgo de falso positivo. `MASWE-0010` (Improper
+  Cryptographic Key Derivation), `CWE-916`.
+- **`MASVS-AUTH-2` (autenticación local)** — `AUTH002`: detecta uso de
+  `android.hardware.fingerprint.FingerprintManager`, deprecada desde Android 9/API 28 en favor
+  de `androidx.biometric.BiometricPrompt`. Nombre de clase completo, sin ambigüedad. `MASWE-0032`
+  (Platform-provided Authentication APIs Not Used), `CWE-477`.
+- **`MASVS-PRIVACY-2` (prevenir identificación del usuario)** — `PRIVACY001`: detecta lectura de
+  identificadores de hardware persistentes (`getImei`/`getDeviceId`/`getMeid`/
+  `getSimSerialNumber`/`getSubscriberId`) usados típicamente para tracking entre instalaciones.
+  `MASWE-0110` (Use of Unique Identifiers for User Tracking), `CWE-359`.
+
+**Quedan sin cobertura, a propósito** (no son verificables de forma determinista analizando solo
+el APK — necesitarían tráfico en vivo, backend, o entendimiento de lógica de negocio/UX):
+`MASVS-AUTH-1` (seguridad de protocolos remotos de auth), `MASVS-AUTH-3` (autenticación adicional
+para operaciones sensibles — requiere saber qué es "sensible" en la lógica de la app),
+`MASVS-CODE-2` (mecanismo de actualización forzada — comportamiento servidor/backend, no
+verificable desde el APK), `MASVS-CODE-3` (SCA — componentes sin vulnerabilidades conocidas;
+requeriría una base de datos de CVEs real, no una lista de patrones regex; queda como follow-up
+explícito, no forzado con datos inventados), `MASVS-PRIVACY-3`/`MASVS-PRIVACY-4` (transparencia y
+control del usuario sobre sus datos — políticas/UX, no analizables estáticamente con confianza).
+
+Se descartó deliberadamente un candidato de baja confianza: detectar `KeyGenerator`/
+`KeyPairGenerator` sin proveedor `AndroidKeyStore` explícito — riesgo real de falso positivo alto
+(muchas apps generan claves simétricas efímeras de un solo uso legítimamente sin necesitar
+respaldo de hardware), se prefirió no incluirlo antes que meter ruido.
+
+**Tests:** 8 nuevos (`tests/test_vuln_scanner_split.py` ×6: positivo/negativo por cada regla
+nueva; `tests/checks/test_registry.py` actualizado para el nuevo id sintético). Suite completa:
+**125/125 passing**. `docs/owasp-mas-coverage.md` regenerado: **18/24 controles**, 68 checks
+totales (66 estáticos + 2 dinámicos), 33/119 debilidades MASWE referenciadas.
+
 ---
 
 ## Fase 3 — Dashboard web local (plugin nuevo)
@@ -496,19 +586,20 @@ reclamados como hechos):
 - El encolado vía `/api/queue` (`run_now=True`) dispara `engine.drain()` en un hilo de fondo
   (no bloquea la respuesta HTTP — un job real puede tardar minutos) — el progreso se sigue por WS.
 
-**Bug real encontrado y corregido (crítico, no de este plugin):** `.gitignore` tenía una regla
-`plugins/` sin anclar que también atrapaba `nutcracker_core/plugins/` — el directorio del **sistema
-de plugins del core**, no solo plugins externos. Cualquier plugin de primera parte nuevo (como este
-dashboard) quedaba invisible para git por completo (`git add -A` lo saltea en silencio, sin error).
-Confirmado que el usuario ya había comiteado Fases 1 y 2 en commits separados (`053b4e4 "fase 1"`,
-`23052d0 "Fase 2"`) — de seguir el mismo patrón para Fase 3, todo este plugin se habría perdido
-silenciosamente. Corregido reestructurando la regla a `nutcracker_core/plugins/*` +
-allow-list explícito de los plugins de primera parte (`aireview`, `dashboard`), preservando el
-comportamiento original para plugins externos (siguen ignorados por defecto; `aipwn` además queda
-protegido por tener su propio `.git` anidado, con o sin esta regla). Un efecto secundario de la
-negación (reincluía también `__pycache__/` dentro de esos plugins) se corrigió reforzando esa regla
-al final del archivo. Verificado con `git check-ignore` y `git add -A --dry-run`: los 12 archivos
-nuevos del plugin dashboard ahora sí quedan listos para `git add`.
+**Nota de `.gitignore` (encontrada, no corregida a pedido explícito del usuario):** `.gitignore`
+tiene una regla `plugins/` sin anclar que también atrapa `nutcracker_core/plugins/` — el directorio
+del **sistema de plugins del core**, no solo plugins externos. Cualquier plugin de primera parte
+nuevo (como este dashboard) queda invisible para git por completo (`git add -A` lo saltea en
+silencio, sin error) — confirmado con `git check-ignore -v`. Se probó y verificó un fix (reestructurar
+la regla a `nutcracker_core/plugins/*` + allow-list explícito de `aireview`/`dashboard`), pero el
+usuario pidió explícitamente no tocar `.gitignore` y dejar el plugin donde está — **decisión
+consciente, no un problema pendiente**: el dashboard queda intencionalmente fuera del tracking de
+git de este repo, igual que ya trataba a `aipwn`. Esto no afecta en nada la funcionalidad (gitignore
+no tiene efecto en tiempo de ejecución) — reconfirmado corriendo la suite completa después de revertir
+el intento de fix: **95/95 passing**. Si en el futuro se quiere trackear el dashboard, el fix ya
+probado es: `nutcracker_core/plugins/*` + `!nutcracker_core/plugins/dashboard/` +
+`!nutcracker_core/plugins/dashboard/**` (cuidado: esa negación reincluye también `__pycache__/`
+dentro del plugin — hay que reforzar `**/__pycache__/` después en el archivo).
 
 **Tests:** 24 nuevos (`tests/dashboard/test_events.py` ×6, `test_api.py` ×10 vía FastAPI TestClient
 sin red real, `test_ws.py` ×4 vía `websocket_connect`, más 2 en `tests/test_queue_engine.py` para el
@@ -568,3 +659,499 @@ instaladas en este entorno, nunca se llegó a invocar `nutcracker aipwn <pkg>` d
   (taxonomía + verdicto dual), `analyzer.py` (`aipwn_bypass_confirmed`).
 - Nuevos (plugin): `nutcracker_core/plugins/dashboard/` (FastAPI + WS + SPA + ws-scrcpy). Sink de streaming
   opcional en `plugins/aipwn/frida_agent.py` / `frida_capture.py`.
+
+---
+
+## Sesión de pruebas con dispositivo físico real (2026-07-24)
+
+Prueba real contra un Moto G23 (Android 14) rooteado con Magisk, con módulos de anti-detección
+avanzados instalados (`hma_oss_zygisk`, `playintegrityfix`, `tricky_store`, `specter`,
+`zygisksu`) — un banco de pruebas realista pensado específicamente para evadir detectores de
+root/RASP. Apps de prueba usadas: `com.example.tapjacking` (sin protección) y `owasp.sat.agoat`
+(AndroGoat, la app oficial de OWASP para práctica de seguridad móvil — protegida). Se evitó
+deliberadamente tocar las apps bancarias reales instaladas en el device (BCP, Yape, Tenpo).
+
+### Hallazgos y fixes aplicados
+
+**🔴 Bug crítico de core (preexistente, no introducido en este plan) — pérdida total de
+resultados con `--launch`.** `orchestrator._launch_frida_bypass()` usaba `os.execvp()`, que
+**reemplaza el proceso Python actual** por el de `frida` (documentado en el propio código:
+"reemplaza el proceso"). Como consecuencia, cualquier `analyze --launch` / `scan --launch`
+contra una app protegida perdía el análisis estático completo — sin JSON, sin PDF, sin fila en
+`runs`/`findings` de SQLite — **sin importar si Frida lograba conectar o no**, porque todo el
+código de persistencia (`save_analysis_json`, PDF, reporte MASVS, post-hooks) vive *después* de
+esa llamada en `_run_analysis()`, y `execvp` nunca retorna. Reproducido en vivo con AndroGoat:
+el análisis estático corrió completo (banner PROTECTED, tabla de hallazgos con certificate
+pinning real) pero `reports/owasp.sat.agoat/` no llegó a existir.
+- **Fix:** `os.execvp(frida_cmd[0], frida_cmd)` → `subprocess.run(frida_cmd)`
+  (`orchestrator.py`). Preserva el uso interactivo original (hereda stdin/stdout/stderr, un
+  humano en terminal sigue viendo el REPL de frida en vivo) pero retorna control al llamador
+  cuando frida termina, permitiendo que el resto del pipeline guarde sus resultados.
+- **Validado en vivo tras el fix:** mismo AndroGoat, mismo dispositivo → `status: done`,
+  `package: "owasp.sat.agoat"`, `run_id: 3`, con `reports/owasp.sat.agoat/` conteniendo JSON +
+  PDF + osint.json + vuln.json, y hallazgos reales persistidos con MASVS+MASWE+CWE completos
+  (p.ej. `HC005 Hardcoded AWS credentials` → `MASVS-STORAGE-2` / `MASWE-0005` / `CWE-798`,
+  encontrado de verdad en `CloudServicesActivity.java` de AndroGoat).
+
+**🔴 Bug de diseño en Fase 1 — jobs dinámicos de la cola dependían de un REPL interactivo.**
+`QueueEngine`/`build_job_cmd` usaban `--launch` para los jobs `kind="dynamic"` — un flag pensado
+para ceder el control a un humano en una sesión interactiva de Frida, incompatible con
+automatización headless (un job de cola sin humano delante quedaría esperando un REPL que nunca
+recibe input).
+- **Fix:** nuevo flag `--dynamic-checks` en `analyze` (core, `cli/analyze.py`) que corre los
+  checks dinámicos de Fase 2 (`checks/dynamic/` — ADB puro, sin Frida, sin REPL) contra
+  `--serial` tras el análisis estático, vía la función nueva
+  `orchestrator._run_dynamic_checks_for()`. `build_job_cmd` renombró su parámetro `launch` →
+  `dynamic_checks`; los jobs dinámicos de la cola ya no invocan `--launch` en absoluto.
+- **Validado en vivo:** el mismo re-run de AndroGoat mostró en el log en vivo del dashboard:
+  `DYN-DEBUGGABLE` **detectado** (`run-as` funcionó — AndroGoat resultó ser debuggable en su
+  instalación real en el device, un hallazgo genuino) y `DYN-CLEARTEXT-TRAFFIC` no detectado
+  (app no lanzada activamente durante la ventana del check) — ambos corrieron sin colgarse.
+
+**🟡 Menor — `default_adb_runner` descartaba `stderr`.** Comandos como `run-as` escriben su
+mensaje real de error a stderr (p.ej. `"run-as: package not debuggable: <pkg>"`); capturar solo
+`stdout` lo perdía en silencio, dejando el campo `detail` de los checks dinámicos sin
+diagnóstico útil. **Fix:** `stderr=subprocess.STDOUT` en `checks/dynamic/context.py`. Validado:
+tras el fix, `DYN-DEBUGGABLE` mostró el detalle real (`"run-as funcionó; JDWP no confirma"`) en
+vez de un string vacío.
+
+**🟡 Menor — `QueueEngine` truncaba a ciegas el campo `error`.** `error = output[-2000:]` perdía
+la causa raíz real cuando el proceso seguía imprimiendo (tablas de hallazgos, banners) después
+del error — se vio en vivo con `"Failed to spawn: ... No route to host"` tapado por una tabla de
+vulnerabilidades posterior, dejando en `error` solo un fragmento ilegible de esa tabla. **Fix:**
+`_extract_error_summary()` nueva en `queue/engine.py` — prioriza líneas con marcadores de error
+conocidos (`error`, `failed`, `no route to host`, `timeout`, `refused`, ...) sobre el tail ciego.
+
+### Confirmado funcionando correctamente contra hardware real (sin cambios necesarios)
+- Detección de protecciones (AndroGoat → `PROTECTED`, MASVS score 70/grade C).
+- Cola con device-lock real (Fase 1) — job dinámico sobre `tapjacking.apk`, sin protección,
+  corrió limpio de punta a punta antes de tocar ningún código.
+- Dashboard completo (Fase 3): API REST, WebSocket de logs en vivo (282+ líneas reales
+  streameadas durante los distintos runs), y **`/api/device/screenshot` capturando la pantalla
+  real del device** (confirmado con una imagen PNG real de 720×1600, no simulada).
+- Fallback automático existente en el código: cuando USB no está disponible, nutcracker ya
+  intenta conectar a frida-server vía la IP WiFi del propio device (`frida -H <ip>:27042`) — un
+  mecanismo inteligente preexistente que solo no funcionó por la limitación de red del entorno
+  de prueba (ver abajo), no por un bug de nutcracker.
+
+### Corrección de diagnóstico: no era un bloqueo de red WSL↔Windows
+El primer diagnóstico de esta sesión (Frida no conectaba: "adb.exe de Windows vs WSL, dos stacks
+de red separados, necesita `wsl --shutdown` + mirrored mode o `usbipd-win`") **resultó
+incorrecto** — quedaba documentado así más arriba antes de esta corrección. La causa real, mucho
+más simple, era una combinación de dos cosas:
+1. **IP equivocada**: `config.yaml` ya tenía `frida_host: '192.168.1.4:27042'` de una sesión
+   anterior — pero la IP real del teléfono (confirmada con la propia captura de pantalla del
+   dashboard, sección "Detalles de la red") era `192.168.1.42`. `.4` simplemente no era un host
+   vivo en esa LAN → "No route to host".
+2. **frida-server sin `-l 0.0.0.0`**: el binario, iniciado sin ese flag, solo escuchaba en
+   `127.0.0.1` — inalcanzable por TCP desde cualquier otro host, WSL incluido.
+
+Con la IP corregida en `config.yaml` y frida-server reiniciado con `-l 0.0.0.0` (vía el fix de
+`_launch_frida_bypass()`/`setup_frida_server` de más abajo), la conexión funcionó **directamente
+desde WSL, sin `wsl --shutdown` ni cambios de `networkingMode`** — confirmado con
+`frida-ps -H 192.168.1.42:27042` listando el proceso real del device. La guía de mirrored
+mode/usbipd-win de más abajo queda como referencia general (útil si algún día SÍ hay un problema
+de ruteo real), pero no era necesaria en este caso — buena lección: verificar la IP y el bind
+antes de asumir un problema de red más profundo.
+
+**🔴 Bug adicional encontrado al preparar la conexión por red — `--launch` nunca escuchaba en
+red.** Al revisar `config.yaml` con `strategies.frida_host`/`frida_server_version` recién
+configurados, se encontró que `_launch_frida_bypass()` reiniciaba frida-server con un simple
+`nohup .../frida-server &` — **sin el flag `-l 0.0.0.0`**, así que el server solo escuchaba en
+`127.0.0.1` sin importar qué tan bien rutee la red. Además ignoraba por completo
+`frida_server_version` (riesgo de mismatch con la librería Python) y no hacía el
+`unset LD_PRELOAD` que sí hace `setup_frida_server()` — necesario específicamente en devices con
+módulos Magisk Zygisk/LSPosed (`hma_oss_zygisk`, `zygisksu`, exactamente los que tiene el
+dispositivo de prueba), que rompen el attach/spawn de Frida si no se limpia esa variable.
+- **Fix:** `_launch_frida_bypass()` ahora reusa `setup_frida_server()` (el mismo mecanismo que ya
+  usa el flujo FART en `pipeline.py`) cuando se pasa `--serial`: descarga/sincroniza la versión de
+  `frida_server_version`, detecta arquitectura del device, y pasa `listen_all=bool(frida_host)`.
+  Sin `--serial` (un único device/emulador, sin forma fiable de resolver arquitectura) se conserva
+  el restart simple de antes como fallback, para no dejar de reiniciar frida-server en absoluto.
+  Un fallo al reiniciar (red caída, etc.) se loggea como warning y no aborta el intento de launch.
+
+### Tests añadidos (34 nuevos, 110/110 en la suite completa)
+`tests/test_orchestrator.py` (9 tests: `execvp`→`subprocess.run`, uso de `setup_frida_server` con
+`listen_all`/`frida_server_version` cuando hay `--serial`, fallback al restart simple sin
+`--serial`, resiliencia si `setup_frida_server` lanza una excepción, `build_job_cmd` con
+`dynamic_checks`, `_run_dynamic_checks_for` incluyendo manejo de checks que fallan),
+`tests/test_queue_engine.py` (+4: `_extract_error_summary`), `tests/checks/test_dynamic_checks.py`
+(+2: `default_adb_runner` combina stderr / retorna vacío si el binario no existe). Todos
+deterministas — no requieren un dispositivo conectado para correr en CI.
+
+## Mejora del dashboard: vista de detalle por app (2026-07-26)
+
+El dashboard de Fase 3 mostraba únicamente una tabla plana de apps (package, verdict, score,
+próxima revisión) — toda la taxonomía OWASP MAS construida en Fase 2 (MASVS/MASWE/CWE por
+hallazgo) y el historial de runs en SQLite existían en el backend pero nunca se exponían en la
+UI. No era un bug: la Fase 3 se había enfocado en logs en vivo + cola, y la Fase 2 llegó después
+sin volver a tocar el frontend. Se cerró ese hueco.
+
+- **Modal de detalle por app** (`nutcracker_core/plugins/dashboard/static/index.html`, sin
+  cambios de backend — `/api/runs/{id}`, `/api/apps/{pkg}/trend` y `/api/schedule` ya existían):
+  clic en cualquier fila de la tabla de apps abre un modal con:
+  - **KPIs** del último run: veredicto, score MASVS + grade, próxima revisión.
+  - **Gráfico de tendencia MASVS** (SVG propio, sin librerías externas): score por run a lo
+    largo del tiempo, un punto por run coloreado según el grade (A/B verde, C ámbar, D naranja,
+    F rojo), gridlines en 0/25/50/75/100, tooltip al hacer hover sobre cada punto
+    (`fecha — Score N (grade)`), labels de fecha en los extremos.
+  - **Editor de revisión periódica** inline (días entre revisiones + botón Guardar → `POST
+    /api/schedule/{package}`), en vez de requerir la CLI para reagendar una app puntual.
+  - **Controles MASVS afectados**: hallazgos agrupados por control MASVS, con la severidad más
+    alta de cada grupo y el conteo.
+  - **Tabla de hallazgos** del último run: regla, severidad (badge con ícono + color, nunca solo
+    color), MASVS, MASWE, CWE, ubicación (archivo:línea).
+- **Paleta de estado**: colores fijos validados vía el skill `dataviz` (good `#0ca30c`, warning
+  `#fab219`, serious `#ec835a`, critical `#d03b3b`) — nunca reciclados como colores categóricos,
+  siempre acompañados de texto/ícono, nunca el único portador del significado.
+- **Verificación visual real**: se sembraron datos de ejemplo (`com.example.bankapp`, 5 runs con
+  progresión de score 45→80, 4 hallazgos con metadata MASVS/MASWE/CWE completa) en una copia
+  local de `nutcracker.db` (gitignorado, jamás commiteado), se levantó el dashboard
+  (`nutcracker.py dashboard --port 8765`) y se capturaron screenshots reales con Playwright
+  (`chromium-headless-shell`) de: la tabla principal, el modal abierto, y el tooltip del gráfico
+  en hover. Cero errores de JS/consola; layout, colores y geometría del gráfico verificados
+  visualmente sin colisiones ni overflow. La base de datos de prueba se descartó después
+  (`rm nutcracker.db*`) para no dejar datos sintéticos en el entorno del usuario.
+- **Sin cambios de backend**: toda la funcionalidad se apoyó en endpoints ya existentes de
+  Fase 3 — confirma que el diseño API-first de esa fase era suficiente para una UI más rica sin
+  tocar `server.py`.
+- Suite completa: **125/125 tests pasan** (sin tests nuevos — cambio puramente de frontend, sin
+  lógica Python nueva que testear; la verificación fue visual vía Playwright, no unitaria).
+
+## Fix: panel "Logs en vivo" mostraba basura coloreada + layout no responsivo (2026-07-26)
+
+El usuario reportó "la web no es responsive" adjuntando dos screenshots: una del panel
+"Dispositivo" (bien) y una del panel "Logs en vivo" mostrando el banner ASCII-art de nutcracker
+como un bloque ilegible de píxeles de colores en vez de texto.
+
+**🔴 Causa raíz del bloque de colores — códigos ANSI truecolor crudos volcados al navegador.**
+`QueueEngine._run_job()` construye el entorno del subproceso con `env = dict(os.environ)`, sin
+tocar nada relacionado a color. Si el proceso que arrancó el dashboard heredó `FORCE_COLOR`
+(algunas terminales/integraciones, p.ej. la terminal integrada de VS Code, lo exportan), rich
+detecta `is_terminal=True` **incluso cuando stdout es un pipe no interactivo** (confirmado
+directamente: `Console().is_terminal` da `True` con solo `FORCE_COLOR=1` en el entorno, sin
+importar `isatty()`) y emite ANSI truecolor real. Ese texto crudo (códigos de escape +
+caracteres de medio-bloque `▄`/`▀` del logo pixel-art) se streamea línea por línea al WebSocket
+y se inserta tal cual en `<pre id="log">` — de ahí el bloque de "píxeles" de colores.
+- **Fix:** `_run_job()` ahora fuerza `env["NO_COLOR"] = "1"` y elimina `FORCE_COLOR` del entorno
+  del subproceso — confirmado que `NO_COLOR` manda por encima de `FORCE_COLOR` en rich (con
+  ambos presentes, 0 códigos de color, solo quedan 2 secuencias OSC8 de hipervínculo inofensivas
+  e invisibles en el navegador). Defensa adicional: nueva `_strip_ansi()` en `queue/engine.py`
+  aplicada a cada línea antes de publicarla via `on_line` (streaming) y al resumen de error
+  (`_extract_error_summary`), por si alguna herramienta de terceros (semgrep, etc.) ignora
+  `NO_COLOR` y fuerza color con sus propios flags.
+- **Validado en vivo:** se reprodujo el bug exacto (servidor arrancado con
+  `FORCE_COLOR=1 COLORTERM=truecolor` forzados) y se confirmó que, tras el fix, el mismo banner
+  se ve en texto monocromo limpio y legible en el panel de logs — captura real vía Playwright.
+
+**🟡 Menor — layout no protegido contra overflow horizontal en viewports angostos.**
+`index.html` (dashboard) no envolvía las tablas de "Apps" y "Cola de análisis" en un contenedor
+con scroll horizontal propio, así que en pantallas angostas (móvil) el ancho de la tabla podía
+forzar scroll horizontal de toda la página. El header (`.stats`) tampoco hacía wrap. La imagen
+`#shot` (captura del device) combinaba `width:100%` (CSS) con `height="360"` (atributo HTML fijo),
+lo que podía distorsionar el aspect ratio de una captura de teléfono real (720×1600) en vez de
+escalarla proporcionalmente.
+- **Fix:** nueva clase `.table-scroll{overflow-x:auto}` envolviendo ambas tablas; `header`/`.stats`
+  con `flex-wrap:wrap`; nuevo breakpoint `@media (max-width:600px)` con paddings/gaps más
+  compactos; `#shot` cambiado a `max-height:70vh;object-fit:contain` sin altura fija, para que la
+  captura del device escale manteniendo su proporción real.
+- **Validado:** Playwright a 375×812 (viewport móvil real) — `document.documentElement.scrollWidth
+  - clientWidth === 0` (cero overflow horizontal), sin errores de JS, captura real revisada
+  visualmente.
+
+**⚠️ Nota operacional durante la verificación:** para reproducir el bug con `FORCE_COLOR` forzado
+se levantó un dashboard de prueba en el puerto 8766 apuntando al `nutcracker.db` real del
+repositorio (mismo `cwd`) — se descubrió ahí un job real preexistente (`#1,
+pe.indigital.tunki.user, running`, el mismo que aparece en la captura que envió el usuario), no
+generado por esta sesión. Se detuvo el servidor de prueba de inmediato y se borraron **solo** las
+filas insertadas por la prueba (`apps`/`schedule`/`queue_jobs` para `com.example.bankapp`),
+dejando el job real #1 completamente intacto sin tocarlo.
+
+Tests añadidos (5, en `tests/test_queue_engine.py`): `_strip_ansi` (colores, hipervínculos OSC8,
+no-op en texto plano), `_run_job` fuerza `NO_COLOR`/limpia `FORCE_COLOR` en el entorno del
+subproceso, `_run_streaming` limpia ANSI de cada línea antes de publicarla. **130/130 tests
+pasan.**
+
+## Documentación + empaquetado (2026-07-26)
+
+Ítem de mantenibilidad transversal, pendiente desde Fase 0 (ver huecos abiertos al inicio de este
+documento): `README.md` no mencionaba en absoluto la cola, el scheduler, el dashboard, ni la
+taxonomía MASWE/CWE — todo el trabajo de las Fases 1-3 era invisible para quien solo lee el
+README. Tampoco existía `pyproject.toml`.
+
+- **`README.md`**: nuevas secciones "Mass Execution: Queue & Scheduler" (`queue add`/`queue
+  ls`/`schedule set`/`schedule ls`/`serve`, con ejemplos reales verificados contra el `--help`
+  actual de cada comando), "OWASP MAS Alignment (MASVS + MASWE + CWE)" (cómo se genera
+  `docs/owasp-mas-coverage.md`, cobertura real 18/24 controles honestamente indicada, no
+  aspiracional), y "Web Dashboard" (`nutcracker dashboard`, qué muestra cada panel, límites
+  conocidos ya documentados en Fase 3). Tabla de plugins actualizada con `dashboard`. Árbol de
+  "Project Structure" reescrito para reflejar el estado real (`cli/`, `store/`, `queue/`,
+  `checks/`, `orchestrator.py`, `scheduler.py`, `plugins/dashboard/` — antes solo listaba los
+  módulos de Fase -1). Bloque de ejemplo de `config.yaml` ampliado con `store:`/`queue:`/
+  `scheduler:`/`dashboard:`.
+- **`config.yaml.example`**: nuevo bloque `dashboard: {bind, port}` — existía en el código
+  (`cfg_get(config, "dashboard", "bind"/"port")`) pero no estaba documentado en ningún lado.
+- **`ROADMAP.md`**: marcados como hechos (con fecha y referencia a la sección de `plan.md`
+  correspondiente) dos ítems que ya estaban completos — "Split `vuln_scanner.py`" (Fase 0.3) y,
+  parcialmente (`[~]`), "Differentiate runtime bypass vs DEX extraction" (los pasos 1-2 de 4 están
+  hechos desde Fase 2.4; los pasos 3-4, banner en `reporter.py` y sección nueva en el PDF, siguen
+  pendientes — documentado así, no reclamado como completo). Añadidos como ítems nuevos: scrcpy
+  real y wiring del chat/razonamiento de `aipwn` en el dashboard (los 2 recortes de alcance
+  honestos ya documentados en Fase 3, ahora también visibles en el roadmap de cara afuera).
+- **`pyproject.toml`** (nuevo): empaqueta `nutcracker_core` (auto-descubrimiento de subpaquetes)
+  con entry point `nutcracker = nutcracker_core.cli:cli` y extra opcional `[dashboard]`
+  (fastapi/uvicorn). `python nutcracker.py <cmd>` en modo script sigue funcionando exactamente
+  igual — el paquete es un modo de instalación adicional, no un reemplazo. Validado con
+  `pip install -e .` real: `nutcracker --help`/`--version` funcionan como comando instalado
+  (`.venv/bin/nutcracker`), y `pip install -e ".[dashboard]"` instala fastapi/uvicorn
+  correctamente. `nutcracker.egg-info/` (artefacto de build, no cubierto por `.gitignore`) se
+  borró manualmente tras cada verificación en vez de tocar `.gitignore`.
+- **Fix menor encontrado de paso**: `@click.version_option("0.1.0", ...)` en `cli/__init__.py`
+  tenía la versión hardcodeada y desincronizada de `nutcracker_core.__version__` (`0.2.0`, la que
+  sí se usa correctamente en el banner). Cambiado a `@click.version_option(_VERSION, ...)`.
+  `nutcracker --version` ahora reporta `0.2.0` en vez de `0.1.0`.
+
+Sin cambios de lógica de negocio — puramente documentación + empaquetado. **130/130 tests
+pasan** (sin tests nuevos: nada de esto tiene comportamiento en tiempo de ejecución que testear
+más allá de lo que ya cubre `test_queue_engine.py`/CLI existente, verificado manualmente con
+`pip install -e .` real en vez de con un test unitario).
+
+## Cierre de los 2 recortes de alcance de Fase 3: scrcpy real + wiring de aipwn (2026-07-27)
+
+El usuario pidió implementar los dos últimos ítems documentados como "alcance reducido" en Fase
+3. Ambos se completaron y **se validaron en vivo contra el Moto G23 real** (dispositivo rooteado
+con Magisk usado en la sesión de pruebas del 2026-07-24), no solo con mocks.
+
+### scrcpy real (video en vivo del dispositivo)
+
+**Investigación previa (documentada por transparencia, no descartada sin más):** se decompiló con
+`jadx` el `scrcpy-server.jar` oficial de Genymobile en 3 versiones (v1.25 vía `apt-get download`
+sin root; v2.4 y v3.1 vía descarga directa de GitHub Releases) para entender el wire protocol
+exacto (socket abstracto `scrcpy`/`scrcpy_<scid>`, header de 68 bytes de device-meta, header de 12
+bytes de frame-meta, modo `raw_video_stream`/flags individuales sin ningún header). Con el
+protocolo ya verificado por lectura de fuente (no adivinado), una reimplementación propia en
+Python (`socket` + `PyAV` para decodificar H.264) **se probó exhaustivamente contra el device real
+y nunca logró completar el handshake** — el servidor se queda colgado indefinidamente dentro de
+`Device()` (antes de aceptar la conexión), sin excepción ni AVC denial visible en `logcat` extenso,
+reproducido igual con 3 versiones distintas del server. Se descartó como enfoque.
+
+**Lo que sí funcionó, y es la implementación final:** el usuario indicó usar su propio scrcpy 3.1
+de Windows (`scrcpy-win64-v3.1`), accedido desde WSL vía interop (`/mnt/c/...scrcpy.exe`,
+ejecutable directamente como ".exe" gracias al interop de WSL2). El binario **real** sí completa el
+handshake contra el mismo device sin problema — confirma que el cuelgue era específico de mi
+reimplementación del protocolo (probablemente algún detalle fino del handshake del cliente real que
+no se pudo reproducir en el tiempo disponible), no una limitación irresoluble del hardware/Magisk.
+
+Como `scrcpy` no ofrece un modo de salida por stdout/pipe (solo GUI o `--record=<file>`, y `--record`
+requiere un archivo real, no `-` /stdout), la solución final es:
+- `nutcracker_core/plugins/dashboard/scrcpy_video.py` (nuevo): lanza
+  `scrcpy --no-window --record=<mkv temporal>` sin ventana; un hilo de fondo relee ese archivo
+  periódicamente con **PyAV** (nueva dependencia del plugin dashboard, `av>=11.0`) y se queda con el
+  último frame decodificado como JPEG — **confirmado empíricamente que el .mkv crece de forma
+  incremental en disco mientras scrcpy sigue grabando** (con actividad real de pantalla; con
+  pantalla estática/bloqueada no se generan frames nuevos, por el optimize de "repeat-previous-frame"
+  de scrcpy — comportamiento esperado, no un bug). La grabación se reinicia cada 20s a un archivo
+  nuevo para acotar el costo de releer un archivo cada vez más grande.
+- **Bug real encontrado y arreglado durante la validación en vivo**: matar el proceso `adb
+  shell`/`scrcpy` LOCAL (`SIGKILL`, o incluso `SIGTERM` a través de la interop WSL↔Windows) **no
+  siempre mata el `app_process` REMOTO en el device** — queda escuchando el socket "scrcpy" para
+  siempre, y cada intento posterior falla con "Address already in use" (server) / "Server
+  connection failed" (cliente). Fix: `ScrcpyVideoSession._kill_orphaned_remote_server()` corre
+  `adb shell pkill -f com.genymobile.scrcpy.Server` (best-effort) antes del primer ciclo y tras
+  cada ciclo fallido.
+- `GET /api/device/video` (nuevo, `api.py`): `StreamingResponse` multipart/x-mixed-replace — el
+  navegador lo reproduce nativo en un `<img>`, sin JS ni librerías adicionales. `GET
+  /api/device/video/status` para que el frontend decida sin arrancar nada. 503 + degradación
+  honesta si no hay binario configurado.
+- `config.yaml` (`dashboard.scrcpy_path`): ruta explícita del usuario a su propia instalación de
+  scrcpy — nutcracker **no vendorea el binario** (¿por qué reimplementar/empaquetar un proyecto de
+  terceros cuando el usuario ya lo tiene?). Vacío = busca `scrcpy`/`scrcpy.exe` en PATH.
+- Frontend (`index.html`): pestaña "Dispositivo" ahora intenta video en vivo primero
+  (`toggleDeviceView()`), con fallback automático y transparente al polling de screenshots
+  existente si no hay binario configurado o si el stream falla a mitad de sesión (`onerror` del
+  `<img>`).
+- **Validado en vivo con Playwright**: captura real mostrando la pantalla actual del device
+  (pantalla "Detalles de la red" con la IP real `192.168.1.42`) dentro del panel del dashboard, nota
+  confirmando "● Video en vivo real (scrcpy) — no es polling", cero errores JS.
+- Tests: `tests/dashboard/test_scrcpy_video.py` (16, todo mockeado — subprocess/PyAV/tiempo — no
+  depende de hardware ni de scrcpy real instalado) + 3 en `test_api.py` para los endpoints nuevos.
+
+### Wiring del agente aipwn en el dashboard
+
+**Streaming del razonamiento en vivo:** en vez de reimplementar un mecanismo de streaming nuevo
+para aipwn, se le dio a `aipwn` un **kind de job nuevo en la cola** (`"aipwn"`, junto a
+`"static"`/`"dynamic"`) que reusa el streaming de logs ya construido en Fase 3 para
+`queue add`/`batch` — `orchestrator.build_job_cmd(..., aipwn=True)` genera
+`nutcracker aipwn <package> [--serial <serial>]` como subproceso aislado (igual que todo lo demás
+en la cola), y su stdout (que ya incluye "Nutcracker thinking", "Nutcracker says", cada tool call)
+se streamea línea por línea al mismo `/ws/jobs/{id}` que ya usan los jobs estáticos/dinámicos — cero
+plumbing nuevo del lado del streaming, solo una nueva forma de construir el comando. Los jobs
+`aipwn` comparten el lock por device-serial con los jobs `"dynamic"` (`QueueEngine.drain()`), ya que
+ambos usan el mismo teléfono físico en exclusiva.
+
+**Chat operador→agente:** el WebSocket `/ws/chat/{package}` de Fase 3 ya publicaba mensajes a un
+bus en memoria, pero nada los consumía — un job `aipwn` corre como **subproceso aislado** de la
+cola (por diseño, ver nota de Fase 1 sobre estado mutuo de `orchestrator.py`), así que no puede ser
+un suscriptor WebSocket. Se agregó un **mailbox pull-based** separado del bus
+(`nutcracker_core/plugins/dashboard/chat_mailbox.py`): cada mensaje de operador también se guarda
+ahí; `FridaAgent._check_operator_chat()` (nuevo método en `frida_agent.py`) hace polling HTTP
+best-effort de `GET /api/chat/{package}/pending` **al inicio de cada iteración de su loop ReAct**
+(antes de llamar al LLM), y si hay mensajes pendientes los inyecta como un turno `user` real en
+`self.messages` — el LLM los ve genuinamente en su próxima respuesta. La URL del dashboard llega al
+subproceso vía la variable de entorno `NUTCRACKER_DASHBOARD_URL`, que solo se define cuando
+`QueueEngine.extra_env` la trae puesta (el
+comando `dashboard` la fija tras calcular host/puerto reales; `serve`/CLI/tests no la definen, así
+que `_check_operator_chat()` es un no-op inmediato y gratis para el 100% de las corridas normales
+por CLI sin dashboard).
+
+**Validado en vivo, con LLM real (aprobado explícitamente por el usuario, gasta tokens reales de su
+`llm.api_key`):**
+- Job `aipwn` #1 contra `com.example.tapjacking` (app de prueba aprobada, no una app bancaria real)
+  encolado vía `POST /api/queue {"kind":"aipwn","serial":"ZY22GPM27J"}` — el razonamiento real del
+  agente (`glm-5.1` vía z.ai) se vio en vivo por `/ws/jobs/{id}`: "Nutcracker thinking", "Nutcracker
+  says", tool calls reales (`get_app_analysis()`, `probe_security_violations()`,
+  `get_heuristic_bypass_script()`, `enumerate_runtime_classes()`, `take_screenshot()`).
+- Job #2: se envió un mensaje real por `/ws/chat/com.example.tapjacking` a los pocos segundos de
+  iniciado. El log en vivo mostró la línea inyectada
+  `[PRUEBA DE VALIDACION] Operador: detente y confirma que recibiste este mensaje antes de
+  seguir.` apareciendo exactamente antes de "Calling LLM (iteration 3)" — confirma el recorrido
+  completo operador→WebSocket→mailbox→subproceso aipwn→turno real de la conversación del LLM.
+- **Hallazgo colateral, no arreglado (fuera de alcance de esta tarea, pre-existente y ajeno al
+  wiring):** ambos jobs terminaron en `LLM error: ... "messages.content.type is invalid, allowed
+  values: ['text']"` tras el primer `take_screenshot()` — el proveedor configurado (z.ai/GLM vía
+  endpoint OpenAI-compatible) rechaza el formato de mensaje multimodal (imagen) que
+  `frida_agent.py` construye para enviar el screenshot al LLM. Bug real de compatibilidad
+  proveedor↔formato de mensaje en `aipwn`, no relacionado con la cola/streaming/chat — no se tocó,
+  documentado aquí para que quede registrado.
+
+Tests: `tests/test_aipwn_chat_wiring.py` (7 — `FridaAgent._check_operator_chat` construido con
+`__new__` para testear el método sin pagar el costo del constructor completo: no-op sin
+`NUTCRACKER_DASHBOARD_URL`, inyecta mensajes reales, url-encoding del package, nunca propaga
+excepciones de red), `tests/dashboard/test_chat_mailbox.py` (4), 2 nuevos en `test_api.py`
+(`/api/chat/{package}/pending`), 1 nuevo en `test_ws.py` (el WS de chat también escribe al
+mailbox), 3 en `test_orchestrator.py`/`test_queue_engine.py` (`build_job_cmd(aipwn=True)`, jobs
+`aipwn` comparten device-lock con `dynamic`).
+
+**Suite completa: 167/167 tests pasan.** Entorno (device + `nutcracker.db` de prueba) limpiado
+después de cada corrida de validación en vivo.
+
+### Follow-up post-entrega: 2 bugs reales encontrados por el usuario en uso normal (2026-07-27)
+
+El usuario reportó "no se puede ver el dispositivo" al usar la pestaña Dispositivo recién
+entregada. Investigación en vivo (no reproducible solo con mocks) encontró dos problemas reales:
+
+**🔴 Bug — limpieza de huérfanos no cubría el caso normal de "detener la vista".**
+`_kill_orphaned_remote_server()` solo corría al inicio de una sesión y tras un ciclo fallido — el
+caso más común (el usuario cierra la pestaña, o el ciclo llega a su fin normal tras
+`_RESTART_INTERVAL_S`) no la ejecutaba. Cada vez que eso pasaba, un `app_process` remoto quedaba
+vivo para siempre ocupando el socket "scrcpy", haciendo fallar en cascada el siguiente intento
+("Server connection failed"). **Fix:** la limpieza ahora corre incondicionalmente después de matar
+el proceso local, sin importar por qué terminó el ciclo.
+
+**🟡 UX — sin feedback visual durante los ~10-15s que tarda en aparecer el primer frame.**
+Confirmado con capturas Playwright reales: a los 8s de clic en "ver dispositivo" seguía en blanco
+(el `<img>` sin `src` cargado colapsa a 0px de alto), recién a los ~12s mostró contenido real.
+Sin ningún indicador, esto es indistinguible de "no funciona". **Fix:** `#shot` con
+`min-height:280px` (caja negra visible de inmediato) + mensaje explícito "Conectando con scrcpy…
+puede tardar varios segundos" hasta que el evento `onload` del `<img>` confirma el primer frame
+real, momento en que cambia a "● Video en vivo real".
+
+**Hallazgo adicional del propio usuario, en forma de pregunta ("¿no puede ser más fluido como
+webadb.com/scrcpy?")** que llevó a una investigación de rendimiento real:
+- Medido contra una grabación real de scrcpy: **decodificar el archivo `.mkv` completo en cada
+  poll cuesta 0.5s cuando el archivo lleva ~18s grabando (~5MB)** — muy por encima de
+  `_POLL_INTERVAL_S` (0.35s original), y el costo **crece** cuanto más dura el ciclo de grabación
+  — la vista se ponía cada vez más entrecortada según pasaba el tiempo dentro de un mismo ciclo de
+  20s.
+- **Fix (validado empíricamente, no solo razonado):** se agregó `--video-codec-options=i-frame-
+  interval=1` al comando de scrcpy (keyframe cada ~1s en vez del default de 10s) y
+  `decode_last_frame_jpeg()` ahora hace `container.seek()` a ~1.5s antes del final del archivo en
+  vez de decodificar desde el principio. Medido: **0.5s/poll → 0.07s/poll (7x)**, con costo
+  prácticamente constante sin importar cuánto lleve grabando — esto permitió subir
+  `_RESTART_INTERVAL_S` de 20s a 120s (menos interrupciones de reconexión) sin volver a degradar.
+- **Techo real, sin resolver — reportado con honestidad, no oculto:** incluso con el fix, la tasa
+  efectiva medida en vivo fue **~1.3 fps** (frames nuevos por segundo), lejos de un video fluido
+  real (15-30fps como ws-scrcpy/webadb.com). Sospecha, no confirmada: el propio muxer mkv de
+  scrcpy probablemente agrupa varios frames por "cluster" antes de volverlos visibles/legibles en
+  disco, imponiendo un techo independiente del costo de decode ya optimizado. Lograr fluidez real
+  requeriría el enfoque original (stream H.264 crudo por socket + decode en el navegador vía
+  WebCodecs) — exactamente lo que se intentó y no se pudo completar contra este hardware endurecido
+  (ver sección "scrcpy real" más arriba). Queda documentado como limitación conocida del enfoque
+  actual, no resuelta en esta sesión.
+
+Tests: +2 en `tests/dashboard/test_scrcpy_video.py` (seek cerca del final cuando `container.duration`
+lo permite; fallback a decode completo si el seek lanza excepción). **169/169 tests pasan.**
+
+## Fase 4 (propuesta, no implementada) — video realmente fluido vía WebUSB + WebCodecs
+
+El usuario preguntó por qué el video no es tan fluido como
+[app.webadb.com](https://app.webadb.com) y si se podía replicar ese enfoque. Investigado y
+**confirmado técnicamente factible** (verificado contra la documentación real del proyecto, no
+contra el primer texto pegado por el usuario — algunos nombres de paquete ahí ya estaban
+desactualizados). Se documenta aquí como plan concreto, **sin implementar todavía** — es un cambio
+de arquitectura real (primer build step de JS del proyecto), no un ajuste rápido.
+
+### Qué es y por qué sería mejor
+app.webadb.com usa **Tango** (antes `ya-webadb`, de yume-chan) — una reimplementación completa y
+madura del protocolo ADB **en TypeScript, corriendo en el navegador vía WebUSB**. El navegador se
+conecta directo al teléfono por USB (sin pasar por ningún `adb`/proceso del lado servidor), empuja
+el `scrcpy-server` real, y decodifica el H.264 crudo con la **WebCodecs API** nativa del navegador,
+dibujando en un `<canvas>`. Esto es fundamentalmente distinto al enfoque actual
+(`scrcpy_video.py`): no hay archivo intermedio, no hay proceso `scrcpy` del lado del servidor, no
+hay polling — es el mismo tipo de decodificación continua que hace un reproductor de video nativo.
+Resolvería de raíz el techo de ~1.3fps documentado arriba.
+
+### Paquetes reales (verificados, no supuestos)
+```bash
+npm install @yume-chan/adb @yume-chan/adb-daemon-webusb @yume-chan/scrcpy \
+            @yume-chan/adb-scrcpy @yume-chan/scrcpy-decoder-webcodecs \
+            @yume-chan/fetch-scrcpy-server
+```
+(`adb-daemon-webusb`, no `adb-backend-webusb` — el nombre cambió en algún punto de la evolución del
+proyecto; `fetch-scrcpy-server` resuelve en build-time la descarga del `scrcpy-server.jar` con la
+versión exacta que espera `@yume-chan/scrcpy`, evitando el mismatch de versión que fue tan
+problemático en la investigación de "scrcpy real" de más arriba). Documentación:
+[tangoadb.dev/scrcpy](https://tangoadb.dev/scrcpy/).
+
+### Restricciones reales a documentar honestamente (no ocultar)
+- **Solo navegadores basados en Chromium** (Chrome, Edge, Opera, Samsung Internet) — WebUSB no
+  existe en Firefox ni Safari (macOS/iOS), ninguna versión. ~76% de soporte global. Debe
+  degradarse con gracia: feature-detect `"usb" in navigator`, y si no está disponible caer al
+  `scrcpy_video.py` actual (que a su vez cae a polling de screenshots) — la misma cadena de
+  degradación honesta ya establecida, con un escalón nuevo arriba.
+- **Requiere "secure context"**: `http://127.0.0.1`/`http://localhost` cuentan como seguros sin
+  necesitar TLS (el uso local típico del dashboard sigue funcionando tal cual), pero si el
+  dashboard se expone en la LAN (`--host 0.0.0.0`) y se accede por `http://<ip-lan>:puerto` desde
+  otra máquina, **WebUSB no estaría disponible** en ese caso sin HTTPS.
+- **El teléfono debe estar conectado por USB a la MISMA máquina que corre el navegador.** Esto es
+  una restricción más estrecha que el enfoque actual: `scrcpy_video.py` funciona con cualquier
+  device alcanzable por `adb` (USB o red, vía el `adb`/`scrcpy` que ya tenga el usuario) — WebUSB
+  no puede alcanzar un device conectado a una máquina remota ni reenviado por red.
+- **Posible conflicto de exclusividad de USB**: mientras el navegador tiene el device reclamado
+  vía WebUSB, no está confirmado si el `adb`/`scrcpy` del sistema (WSL, Windows, o el propio
+  `scrcpy_video.py`) puede seguir usándolo en simultáneo — a validar en vivo antes de dar esto por
+  cerrado; podría requerir que el usuario libere la pestaña de video antes de correr un job
+  dinámico/aipwn, o viceversa.
+- **Primer build step de JS del proyecto.** El dashboard (Fase 3) es deliberadamente un único
+  HTML self-contained, sin CDN ni dependencias externas. Estos paquetes de Tango son sustanciales y
+  necesitan bundling (Vite/esbuild) — la propuesta es un subproyecto npm nuevo
+  (`nutcracker_core/plugins/dashboard/webusb/`, con su propio `package.json`) cuyo `npm run build`
+  produce un único archivo `.js` bundleado que se commitea al repo y se sirve como estático más —
+  el HTML servido en runtime sigue siendo self-contained (nada se descarga de un CDN en tiempo de
+  ejecución), pero el *desarrollo* de ese archivo sí requiere Node/npm, algo que hoy el proyecto no
+  necesita para nada del dashboard.
+
+### Integración propuesta (no implementada)
+- Nuevo escalón en la cadena de degradación de la pestaña "Dispositivo": **WebUSB+WebCodecs**
+  (mejor, si `navigator.usb` existe y el usuario autoriza el device) → `scrcpy_video.py` actual
+  (si hay `dashboard.scrcpy_path` configurado) → polling de screenshots (siempre disponible).
+- El backend Python **no necesita lógica nueva para el video en sí** — todo el streaming ocurre
+  en el navegador, directo al USB. El backend solo serviría el bundle `.js` compilado y el
+  `scrcpy-server.jar` correcto como estáticos (ya resueltos en build-time por
+  `@yume-chan/fetch-scrcpy-server`).
+- Verificación honesta pendiente antes de implementar: confirmar en vivo (contra el mismo Moto G23)
+  que el WebUSB del navegador puede reclamar el device sin conflicto con `adb`/`scrcpy` del
+  sistema, y medir el fps real resultante contra la promesa de fluidez.
+
+**Estado: documentado y factible, no implementado.** Requiere decisión explícita del usuario para
+proceder (introduce Node/npm al proyecto por primera vez) antes de escribir código.
