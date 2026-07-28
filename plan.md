@@ -1513,3 +1513,203 @@ Tests nuevos (6, `tests/test_downloader_device.py`): detección de los 4 marcado
 transitorio, no-op para seriales USB, `adb connect` disparado para seriales `ip:puerto`,
 reintentos ante falla transitoria (tanto en `_ensure_network_serial_connected` como en el propio
 `pm path` de `download()`). **187/187 tests pasan.**
+
+## Borrado de jobs pendientes en la cola (2026-07-27)
+
+Pedido del usuario: poder borrar un job de la cola antes de que corra.
+
+**`repository.delete_job(conn, job_id) -> bool`** — borra solo si `status='queued'` (`DELETE ...
+WHERE id = ? AND status = 'queued'`, `rowcount > 0` como señal de éxito). Deliberadamente NO borra
+jobs `running` (ya tienen un subproceso real corriendo en algún proceso -- borrar la fila no lo
+mata, solo lo desincroniza) ni `done`/`error` (son historial). Expuesto en:
+- CLI: `nutcracker queue rm <id> [<id> ...]` (`cli/queue_cmd.py`).
+- Dashboard: `DELETE /api/queue/{job_id}` (`api.py`, 404 si no existe o no está `queued`) + botón
+  🗑 por fila en la tabla de cola, visible solo para jobs en estado `queued`.
+
+**Limitación conocida, no resuelta (inherente al diseño de la cola)**: si un job ya fue cargado a
+memoria por un `drain()` en curso en OTRO proceso (CLI/scheduler/dashboard corriendo en paralelo),
+borrar la fila de SQLite no cancela ese despacho en memoria -- `_load_queued_from_db()` solo
+recarga al *empezar* un `drain()`, no re-consulta por cada job durante la ejecución. Cubre el caso
+común (sacar un job de la cola antes de que cualquier proceso lo levante), no una cancelación en
+caliente de un job ya en pleno `drain()`.
+
+Tests nuevos (5): `test_delete_job_removes_queued_job`/`_returns_false_for_unknown_id`/
+`_refuses_to_delete_running_job` (`test_queue_engine.py`, este último con un job real bloqueado en
+un hilo de fondo vía `threading.Event` para confirmar que `delete_job` no lo toca mientras está
+`running`), `test_queue_delete_removes_pending_job`/`_404_for_unknown_job`
+(`tests/dashboard/test_api.py`). **192/192 tests pasan.**
+
+## Respuesta: ¿paralelo o secuencial? + investigación de crashes de WSL (2026-07-27)
+
+El usuario preguntó si los jobs corren en paralelo o secuencial (sospechando que eso causaba
+crashes periódicos de su entorno WSL), pidiendo investigar de paso.
+
+**Respuesta:** en paralelo, por diseño (`config.yaml`, bloque `queue:`): `static_workers: 4` (hasta
+4 análisis estáticos -- decompilación jadx/apktool, semgrep, OSINT -- corriendo a la vez, cada uno
+en su propio subproceso `nutcracker analyze/scan`) y `dynamic_workers: 2` (hasta 2 *dispositivos*
+distintos en paralelo para jobs Frida/ADB, pero siempre serializado dentro del mismo serial vía el
+lock por device de Fase 1). `static_workers: 1` en `config.yaml` lo vuelve estrictamente
+secuencial si se prefiere.
+
+**Investigación de los crashes** (sin poder reproducirlos en vivo -- ya habían pasado):
+- `dmesg` no tenía entradas de OOM-killer al momento de revisar (el propio reinicio de la VM de
+  WSL2 borra su buffer de kernel, así que esto no descarta un OOM previo, solo que no quedó rastro).
+- **No existe `.wslconfig`** en el usuario (`/mnt/c/Users/*/.wslconfig` no encontrado) -- WSL2 usa
+  el límite de memoria *default* (mínimo entre 50% de la RAM del host y 8GB). `free -h` reportó
+  **7.7GB de total** para la VM de WSL2, confirmando ese techo.
+- Disco descartado como causa: 933GB libres de 1TB, `downloads/`+`decompiled/` juntos solo 750MB.
+- **Hipótesis más plausible** (no confirmada en vivo, pero consistente con la evidencia): 4 jobs
+  estáticos en paralelo (jadx/semgrep/androguard, herramientas conocidas por su uso pesado de
+  memoria con APKs grandes/ofuscados) + video WebUSB/scrcpy + el propio VS Code Server (~1.5GB de
+  base, visto en `ps aux --sort=-%mem`) pueden acercarse o superar ese techo de 7.7GB, llevando a
+  Windows/Hyper-V a matar o reiniciar la VM de WSL2 -- indistinguible para el usuario de "se me
+  crashea WSL".
+- **Recomendado al usuario** (no aplicado automáticamente -- requiere tocar un archivo del lado de
+  Windows y reiniciar WSL, decisión del usuario): crear `.wslconfig` con un `memory=` más alto si
+  el host tiene RAM de sobra, y/o bajar `queue.static_workers` de 4 a 2 en `config.yaml` para
+  reducir el pico de uso concurrente.
+
+---
+
+## Keepalive del transporte adb-over-wifi (2026-07-27)
+
+**Síntoma reportado:** el video WebUSB del dashboard fallaba a cada rato con *"el dispositivo ya
+está reclamado por otro programa (adb)"*, sin que el usuario ejecutara nada a mano. Además, jobs de
+la cola morían con `device '172.20.10.6:5555' not found` pese a que el teléfono estaba accesible.
+
+### Diagnóstico (con evidencia del entorno real, no supuestos)
+
+1. **El driver ya era WinUSB, así que Zadig no aplicaba.** Se había sugerido reasignar el driver de
+   la interfaz ADB a WinUSB; la inspección del dispositivo real lo desmintió:
+
+   ```
+   DEVPKEY_Device_Service        : WINUSB
+   DEVPKEY_Device_DriverDesc     : WinUsb Device
+   DEVPKEY_Device_DriverProvider : Microsoft
+   ClassGuid                     : {88BAE032-5A81-49F0-BC3D-A4FF138216D6}   (clase USBDevice)
+   ```
+
+   El teléfono ya estaba en WinUSB. Zadig habría sido un no-op. **La causa real del conflicto es que
+   WinUSB permite un solo handle abierto por interfaz**, y tanto `adb.exe` (que en Windows accede vía
+   WinUSB) como Chrome (WebUSB → WinUSB) piden *la misma* interfaz. Ningún cambio de driver lo
+   resuelve: es exclusividad estructural.
+
+2. **El daemon adb reclama el cable aunque solo se lo use por TCP.** Demostrado en vivo: con
+   `strategies.default_device_id = "172.20.10.6:5555"` y los 3 jobs en vuelo usando ese serial,
+   `adb devices -l` mostraba igual **ambos** transportes:
+
+   ```
+   ZY22GPM27J         device ... transport_id:2   <- el CABLE (nadie lo pidió)
+   172.20.10.6:5555   device ... transport_id:3   <- el WiFi
+   ```
+
+   Un daemon recién arrancado enumera y abre toda interfaz ADB USB que vea, sin importar el
+   transporte que se le pida. Por eso la receta popular de "conectá el daemon por TCP y el cable
+   queda libre" **es falsa**: separar canales es necesario pero no suficiente.
+
+3. **La causa inmediata del fallo: el canal TCP se caía solo.** `adb -s 172.20.10.6:5555 get-state`
+   devolvía `device not found` mientras el teléfono respondía a ping y tenía el 5555 abierto — lo
+   caído era el *transporte*, no el dispositivo. Esa conexión vive en el daemon adb y no sobrevive a
+   un reinicio suyo (crash, `adb kill-server`, sleep/wake) ni a cortes de red del teléfono (doze,
+   hotspot). Con el canal 2 muerto, **todo colapsa sobre el cable** — exactamente el conflicto que la
+   separación buscaba evitar. La reconexión automática existente vivía solo en `downloader.py`, y se
+   dispara al descargar: no cubría los huecos entre jobs ni jobs que no descargan.
+
+### Implementación
+
+- **Nuevo `nutcracker_core/adb_transport.py`** — hogar canónico de la salud del transporte adb:
+  - `is_network_serial()` distingue serial de red de serial USB.
+  - `is_transport_alive()` usa `adb -s <serial> get-state` en vez de parsear `adb devices`: con un
+    solo comando distingue *ausente* (rc≠0), *presente pero inutilizable* (`offline`,
+    `unauthorized`) y *listo* (`device`).
+  - `ensure_connected()` = la lógica que estaba en `downloader.py` (`adb connect` idempotente con
+    reintentos ante fallas transitorias del daemon, ver `_DAEMON_TRANSIENT_MARKERS`).
+  - `ensure_available()` chequea estado **antes** de reconectar. Esto es deliberado: `adb connect`
+    arranca el daemon si no corre, y un daemon nuevo re-reclama el cable USB — si el transporte ya
+    está vivo, no hay razón para arriesgar ese efecto colateral contra el video WebUSB.
+  - `TransportKeepAlive` — hilo daemon que revalida periódicamente los seriales de red vigilados.
+- **`downloader.py`** pasa a usar el módulo compartido (reexporta los nombres privados anteriores
+  para no romper a quien los importaba) y `download()` usa `ensure_available()` en vez del `connect`
+  a ciegas.
+- **`QueueEngine._ensure_transport()`** revive el transporte antes de cada job con serial de red, y
+  registra ese serial en el keepalive si hay uno asignado (cubre jobs con serial distinto al del
+  config). Es best-effort: si no se puede restablecer, el job se lanza igual para que falle con su
+  propio mensaje, más específico que cualquiera que diéramos acá.
+- **`nutcracker dashboard` y `nutcracker serve`** levantan un `TransportKeepAlive` sobre
+  `strategies.default_device_id` y lo paran al salir. Nuevo `dashboard.adb_keepalive_seconds`
+  (default 60, piso efectivo 10) en `config.yaml`/`config.yaml.example`.
+
+### Verificación
+
+- Suite completa: **214 tests pasan**. 20 nuevos (`tests/test_adb_transport.py` + integración con el
+  engine en `tests/test_queue_engine.py`), incluido el caso de que un transporte ya vivo **no** se
+  reconecte (protege al WebUSB), y que un chequeo que explota no tumbe el job ni el hilo.
+- Prueba funcional contra el teléfono real: se simuló la falla exacta con `adb disconnect`, y
+  `ensure_available()` la detectó y la recuperó (`alive: False` → reconexión → `alive: True`, nuevo
+  `transport_id`).
+
+### Límite que sigue en pie (no lo arregla este cambio)
+
+WebUSB y `adb.exe` **no pueden compartir el cable**: WinUSB es de handle exclusivo. Lo que este
+cambio garantiza es que el canal TCP no se muera, para que el cable pueda quedar para el navegador
+sin que la cola se quede sin vía al teléfono. El orden sigue importando: conviene conectar el video
+WebUSB **primero**; cuando el daemon reintente el cable y lo encuentre ocupado, sigue funcionando
+por TCP.
+
+---
+
+## WebUSB: sobrevivir a un F5 (2026-07-27)
+
+**Pedido:** que el video "USB directo (fluido)" no muera al recargar la página.
+
+### Lo que no se puede, y por qué
+
+Un reload destruye el contexto JS y con él el handle USB, el decoder y el canvas. **La sesión no
+puede seguir viva**: no existe API de navegador que preserve una conexión WebUSB a través de una
+navegación. Lo que sí persiste es el **permiso** que el usuario otorgó al origen — y eso alcanza
+para reconstruir la sesión sin intervención.
+
+### Implementación
+
+- `AdbDaemonWebUsbDeviceManager.getDevices()` (verificado en `manager.d.ts`: *"Get all connected and
+  requested devices"*) devuelve los dispositivos ya autorizados **sin abrir el picker**, que además
+  exigiría un gesto del usuario. El F5 pasa de "elegí el device otra vez y esperá" a "esperá un par
+  de segundos".
+- `main.ts` se reestructuró: `connect()` (con picker, requiere click) y `reconnect()` (sin picker)
+  comparten `startVideo()`. Ambos devuelven el serial conectado (o `null`), que el frontend usa para
+  recordar a qué dispositivo volver.
+- `reconnect()` **reintenta ante "device busy"** (3 intentos, 600ms): justo después de un reload
+  Chrome puede tardar un instante en liberar el handle de la sesión anterior, y el primer intento se
+  topa con su propio fantasma.
+- Nuevo `disconnect()` + botón **"⏏ Soltar USB"**. El cable es exclusivo (WinUSB, un handle por
+  interfaz), así que sin una forma explícita de soltarlo la única salida era cerrar la pestaña —
+  inaceptable en este flujo, donde el usuario alterna entre video y jobs por adb. Cierra decoder,
+  client y adb, cada uno en su propio `try`: si el primero falla (device desenchufado en caliente),
+  los demás igual corren, o el handle queda tomado hasta recargar.
+- `startVideo()` llama a `disconnect()` primero: dos sesiones sobre el mismo cable se pisan (el
+  device queda "busy" contra sí mismo).
+- El pipe del stream ahora usa un `AbortController`; un abort es cierre normal, no un error que
+  reportar en la UI.
+
+### Decisión de diseño: sessionStorage, no localStorage
+
+El serial se guarda en **`sessionStorage`**, que tiene exactamente la vida útil que se busca:
+sobrevive a un reload, muere al cerrar la pestaña. Así la reconexión automática ocurre **solo en la
+pestaña donde el usuario ya pidió video explícitamente**. Abrir el dashboard de cero nunca reclama
+el USB por su cuenta — reclamarlo sin que lo pidan dejaría a adb sin cable y rompería los jobs de la
+cola (el usuario ya había rechazado un auto-arranque parecido, ver la sección de eliminación del
+auto-trigger de scrcpy). `disconnect()` borra el serial *antes* de cerrar: si el cierre falla a
+mitad, el próximo F5 no debe volver a reclamar el cable solo.
+
+### Verificación
+
+- `tsc --noEmit` limpio; `npm run build` OK (bundle de 317KB — no el bundle vacío de 0 bytes que
+  producía el modo "app" de Vite antes del fix a `build.lib`).
+- Los 5 exports (`isSupported`, `connect`, `reconnect`, `disconnect`, `isConnected`) verificados
+  presentes en el bundle emitido, no solo en el fuente.
+- Script inline del dashboard parsea sin errores de sintaxis; el server sirve el HTML y el bundle
+  actualizados (HTTP 200).
+- Suite Python: 214 tests siguen pasando (sin cambios de backend en esta tanda).
+
+**Pendiente de prueba manual del usuario:** el ciclo real conectar → F5 → reconexión automática
+contra el teléfono, que no se puede ejercitar sin un navegador con el cable enchufado.
