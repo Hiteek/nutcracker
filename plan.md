@@ -1838,3 +1838,75 @@ Nota: para `com.bcp.bo.discounts` específicamente esto no cambió el resultado 
 exportados ya tenían `android:permission` seteado, y el launcher se excluye a propósito) -- pero el
 gap era real y afectaba a cualquier app con componentes realmente desprotegidos mientras
 `sast_scan: false`.
+
+---
+
+## Toolbox estático en Docker (2026-07-28)
+
+**Pedido:** un "toolbox" que contenga las herramientas de análisis estático en Docker, con una capa
+de acceso uniforme -- inspirado en la arquitectura de auto_pentest (toolbox estático en contenedor,
+dinámico en el host contra el dispositivo físico real).
+
+### Alcance de esta pasada (acotado explícitamente antes de empezar)
+
+Implementado: el toolbox estático + la capa de acceso (`nutcracker_core/toolbox/`) + integración
+en `decompiler.py` (jadx/apktool). **Deferido** (no implementado, a pedido explícito si hace falta
+después): servidor MCP (`--serve-mcp`), dashboard de monitoreo separado (nutcracker ya tiene uno),
+`device_pool.py`, `mitm_addon.py`, librería curada de scripts Frida -- todo eso son subsistemas
+propios, no una extensión natural de "empaquetar binarios en Docker".
+
+### Diseño
+
+- `nutcracker_core/toolbox/client.py`: `is_enabled(config)`, `run(tool, args, config, timeout)`,
+  `ensure_image()`/`image_exists()` (build local, sin depender de un registry propio).
+- `nutcracker_core/toolbox/docker/Dockerfile.static`: imagen con 14 herramientas -- aapt, aapt2,
+  apktool, baksmali, smali, jadx, r2 (radare2), readelf, nm, objdump, blint, gitleaks, apkid,
+  apksigner.
+- **Opt-in real**: `toolbox.enabled: false` (default en config.yaml/config.yaml.example) preserva
+  100% el comportamiento preexistente -- cada módulo sigue invocando binarios locales vía
+  `shutil.which()`. Con `true`, las mismas llamadas se enrutan a `toolbox.run()` sin cambiar su
+  propia lógica (`decompiler._find_tool()` devuelve un sentinel `TOOLBOX` en vez de `None`).
+- Montaje de volumen: `Path.cwd()` del host al contenedor en la **misma ruta absoluta** (todo el
+  código de nutcracker opera sobre rutas relativas al proyecto, nunca fuera de él) -- evita lógica
+  de traducción de rutas host↔contenedor.
+
+### Verificación real (no solo diseño en papel)
+
+Docker no estaba accesible al principio (WSL integration desactivada en Docker Desktop) -- se
+verificó cada URL de descarga a mano (`curl`) antes de fijar versiones en el Dockerfile. Una vez el
+usuario activó la integración a mitad de la tarea, se **construyó la imagen real** y se encontraron
+y corrigieron dos problemas que el diseño en papel no hubiera revelado:
+
+1. **`radare2` no está en los repos base de Ubuntu 22.04** (`E: Package 'radare2' has no
+   installation candidate` -- solo disponible en `jammy-backports`, no habilitado en la imagen base
+   de Docker). Fix: instalar desde el `.deb` oficial publicado en cada release de GitHub en vez de
+   depender de qué repos apt tenga habilitados la imagen base.
+2. **`pip3 install --break-system-packages` no existe en el pip3 de Ubuntu 22.04** (esa protección
+   -- PEP 668 -- es de versiones de pip más nuevas). Fix: sacar el flag, innecesario en un
+   contenedor aislado de un solo uso.
+3. **Bug de permisos encontrado recién al decompilar un APK real vía el toolbox**: sin `--user
+   {uid}:{gid}` en `docker run`, todo lo que el contenedor escribe queda con dueño `root` -- el
+   usuario del host ni siquiera podía sobreescribir su propio output después (un `apktool --force`
+   en un rerun habría fallado con "Permission denied", confirmado en vivo intentando borrar el
+   resultado). Fix: `client.run()` ahora pasa `--user {os.getuid()}:{os.getgid()}`.
+
+Tras los 3 fixes: build completo exitoso, las 14 herramientas responden dentro del contenedor
+(`--version`/`-v`/`--help` según cada una), y **dos pruebas end-to-end reales** a través del propio
+código de nutcracker (no solo `docker run` suelto):
+- `decompiler.decompile()` con `toolbox.enabled: true` contra un APK real (`com.bcp.bo.wallet`) →
+  25,706 archivos `.java` reales vía jadx, dueño correcto (UID del host).
+- `decompiler._decompile_apktool()` (el camino de fallback) contra otro APK real
+  (`com.bcp.bo.discounts`) → 21,939 archivos `.smali`, mismo resultado correcto.
+
+### Tests
+
+19 tests nuevos (`tests/test_toolbox_client.py` + los de modo toolbox en `tests/test_decompiler.py`),
+todos mockeando subprocess/docker -- no requieren Docker instalado para correr en CI. Suite completa:
+**244 tests pasan**.
+
+### Pendiente si se quiere extender
+
+- Integrar el toolbox en `native_scanner.py` (nm/objdump/readelf/radare2) y `leak_scanner.py`
+  (gitleaks) -- mismo patrón, no hecho todavía.
+- Los subsistemas deferidos arriba (MCP server, device pool, mitmproxy addon, frida_scripts
+  curados), si el usuario los pide explícitamente.
