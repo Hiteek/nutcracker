@@ -1713,3 +1713,128 @@ mitad, el próximo F5 no debe volver a reclamar el cable solo.
 
 **Pendiente de prueba manual del usuario:** el ciclo real conectar → F5 → reconexión automática
 contra el teléfono, que no se puede ejercitar sin un navegador con el cable enchufado.
+
+---
+
+## Fix: aipwn no persistía nada + diagnóstico de "hallazgos vacíos" (2026-07-27)
+
+**Reportado por el usuario:** "los cambios no se guardaron de los análisis" + "en apps, al revisar hallazgos no encuentro ninguno".
+
+### Hallazgo 1 (bug real, corregido): jobs `aipwn` nunca tocaban SQLite
+
+`fire_post_hooks("after_analysis", ...)` (el único punto que dispara `store/hooks.py`, que escribe
+`runs`/`findings`/`artifacts`) vive **solo** dentro de `orchestrator._run_analysis()` — la función
+que usan `scan`/`analyze`. `aipwn.py` es un comando aparte que nunca pasa por ahí. Confirmado en
+vivo: jobs `aipwn` con `status: done` pero `run_id: None` (`2798`, `2796`, `2792`), mientras que jobs
+`static` de los mismos paquetes sí quedaban enlazados a un run real.
+
+Además, incluso lo que `aipwn` **sí** puede volcar a disco (`exploit_report_<pkg>.json/.pdf`, con los
+PoC confirmados/no confirmados) solo se genera `if report:` (flag `--report` del CLI) — y
+`orchestrator.build_job_cmd(aipwn=True)` nunca lo pasaba. Un job de aipwn lanzado desde el dashboard
+corría el `ExploitAgent` completo y tiraba el resultado: lo único que sobrevivía era el `.txt` crudo
+en `logs/`.
+
+**Fix aplicado (alcance acordado con el usuario -- mínimo, no el rediseño completo de persistencia a
+SQLite):** `build_job_cmd` ahora siempre agrega `--report` para `aipwn=True`, con o sin serial. Así
+el JSON/PDF de exploits queda en disco sin importar si aipwn corrió desde el dashboard o a mano.
+Tests actualizados en `tests/test_orchestrator.py` (`test_build_job_cmd_aipwn_always_passes_report`).
+
+**Pendiente, fuera de este alcance (el usuario puede pedirlo después):** que aipwn cree su propio
+`run` en SQLite (kind="aipwn") con los PoC confirmados como findings, para que aparezca en el
+historial del dashboard con su propio veredicto/evidencia, en vez de solo el JSON/PDF en disco.
+
+### Hallazgo 2 (no es un bug): "hallazgos vacíos" en varias apps es real, no un fallo de guardado
+
+Para `org.credicorp.bcpglobal`, `com.bcp.bo.discounts` y `bo.com.bcp.credinetweb`, la API sí
+devuelve los `findings` que existen (verificado con `curl /api/runs/{id}` -- ninguno perdido) — pero
+son genuinamente **cero**, porque:
+
+- Ni la decompilación estática (jadx) ni el volcado runtime (Frida) produjeron código fuente
+  utilizable (`decompiled/<pkg>/` y `decompiled/runtime_dump_<pkg>/` no existen para ninguna de las
+  tres). `vuln.json` confirma `"files_scanned": 0`.
+- `protection_broken: False` en las tres -- la protección de estas apps (bancarias reales, DexGuard/
+  similar) todavía no se rompió.
+- Sin código fuente, `leak_scan.native`/`gitleaks` no tienen nada sobre qué correr. Solo
+  `leak_scan.apkleaks` (escanea el `.apk` crudo sin decompilar) podría encontrar algo igual, y para
+  estas tres no encontró nada notable.
+- Contraste: `com.bcp.bo.wallet` sí tiene 4 findings (HC004, credenciales de Firebase/Google) --
+  pero vienen de `apkleaks` sobre `AndroidManifest.xml`/`strings.xml` crudos, no de código
+  decompilado (`decompiled/com.bcp.bo.wallet/` existe pero con 0 archivos .java/.smali).
+
+Es exactamente el escenario que el pipeline "protected" (runtime/Frida) existe para resolver, y lo
+mismo que el usuario venía probando con `aipwn`: romper la protección primero habilita un dump/
+decompile real, que a su vez habilita hallazgos de código reales en corridas futuras.
+
+---
+
+## Fix: colisión de directorios entre jobs estáticos concurrentes (2026-07-28)
+
+**Reportado por el usuario:** "en el dashboard el apartado de apps no aparece los hallazgos" para
+varias apps bancarias reales analizadas por la cola.
+
+### Diagnóstico
+
+Verificado con la API (`/api/runs/{id}`) que el dashboard no pierde nada: refleja fielmente lo que
+hay en SQLite. El run problemático (`org.credicorp.bcpglobal`, 2026-07-27 19:38) realmente tenía
+`files_scanned: 0` -- pero no por protección/DexGuard sin romper, como se había concluido en un
+diagnóstico anterior de esta misma sesión.
+
+**Causa real, encontrada al reproducir el pipeline en vivo:**
+
+1. `jadx` no está instalado en este entorno (`jadx: command not found`), así que el pipeline cae al
+   fallback `apktool` (sí presente, `2.7.0-dirty`). Corriendo `apktool` a mano contra el `.apk` de
+   `org.credicorp.bcpglobal`, decodifica sin problema: 30,156 archivos `.smali`.
+2. **El bug**: `decompiler.decompile()` nombraba el directorio de salida con `apk_path.stem` (el
+   nombre del archivo, sin extensión) -- pero `apkeep` guarda el APK base de un Android App Bundle
+   literalmente como `base.apk` **para cualquier paquete**. Confirmado: `bo.com.bcp.credinetweb`,
+   `org.credicorp.bcpglobal` y `com.bcp.bo.discounts` se descargaron los tres como `base.apk`.
+3. Esos 3 jobs estáticos se encolaron **en el mismo segundo** (19:36:22-23, con `static_workers` > 1
+   en ese momento), así que los 3 procesos decompilaban **simultáneamente hacia el mismo
+   `decompiled/base/`** -- `apktool --force` de un job borraba/recreaba el directorio que otro job
+   estaba escaneando a mitad de camino, dejando `files_scanned: 0` para el que perdía la carrera.
+
+Confirmado corriendo `analyze downloads/org.credicorp.bcpglobal/base.apk --static-only` de forma
+aislada (sin concurrencia): decompiló bien y encontró 2 hallazgos reales (`HC004`, credenciales de
+Firebase) -- quedó persistido como run #12, visible en el dashboard tras refrescar.
+
+### Fix
+
+- `decompiler.decompile(apk_path, output_dir, dest_name=None)`: nuevo parámetro opcional que nombra
+  el subdirectorio de salida. Default `apk_path.stem` (compatible hacia atrás). `_decompile_jadx`/
+  `_decompile_apktool` reciben `dest_name` en vez de derivarlo internamente.
+- `orchestrator._do_decompile()` (único call site) pasa `dest_name=package` -- cada paquete
+  decompila a `decompiled/<package>/`, nunca a un nombre compartido derivado del archivo.
+- `decompiler.extract_manifest()` tenía el mismo riesgo (`_manifest_apktool_{apk_path.stem}`,
+  `_manifest_jadx_{apk_path.stem}` -- usado en el flujo de runtime dump sin manifest). Mismo fix:
+  nuevo parámetro `name_hint`, `manifest_analyzer.py` pasa `decompiled_dir.name` (ya único, incluye
+  el package).
+
+### Verificación
+
+- 5 tests nuevos en `tests/test_decompiler.py`, incluido uno que documenta explícitamente la
+  colisión tal cual se manifestaba antes del fix (`test_decompile_two_base_apks_without_dest_name_would_collide`).
+  Suite completa: 220 tests pasan.
+- Reproducido en vivo el bug arreglado: el run recién corrido (#12) para `org.credicorp.bcpglobal`
+  ya no colisiona y persiste hallazgos reales.
+
+---
+
+## Fix adicional: hallazgos COMP del manifest se perdían con sast_scan:false (2026-07-28)
+
+Al re-correr `com.bcp.bo.discounts` para verificar el fix de colisión de directorios, encontré un
+segundo bug real (independiente): con `features.sast_scan: false` en `config.yaml` (la config real
+del usuario), `_do_vuln_scan()` toma un camino "solo leak scan" que **retorna antes** de llegar al
+bloque que inyecta hallazgos COMP004/006/007/008 (componentes exportados sin `android:permission`,
+detectados desde el manifest, sin relación con SAST/semgrep). Resultado: esos hallazgos nunca se
+generaban para ningún análisis mientras `sast_scan` estuviera deshabilitado -- independientemente de
+si la app realmente tenía componentes exportados sin proteger.
+
+**Fix:** la lógica de inyección se extrajo a `_inject_manifest_component_findings(scan_result)` y se
+llama desde **ambos** caminos de `_do_vuln_scan` (con y sin `include_vuln_scan`). 5 tests nuevos en
+`tests/test_orchestrator.py`, incluida la regresión directa (`test_do_vuln_scan_leak_only_path_still_adds_comp_findings`).
+Suite completa: **225 tests pasan**.
+
+Nota: para `com.bcp.bo.discounts` específicamente esto no cambió el resultado (sus componentes
+exportados ya tenían `android:permission` seteado, y el launcher se excluye a propósito) -- pero el
+gap era real y afectaba a cualquier app con componentes realmente desprotegidos mientras
+`sast_scan: false`.
