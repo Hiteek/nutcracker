@@ -2146,3 +2146,490 @@ fuente de verdad. El JSON truncado del modelo nunca vuelve a persistir en el his
 truncado se sanea a `{}` tanto en el historial como en el despacho local (y ambos coinciden). Suite
 completa: 309 tests pasan (los mismos 6 fallos preexistentes sin relación, ver fix anterior de
 `.smali`/toolbox).
+
+---
+
+## Feature: relay "browser-as-bridge" -- frida/adb desde un backend remoto (M1, 2026-08-04)
+
+**Motivación:** el usuario quiere nutcracker viviendo en la web, accedido por cualquiera desde su
+propia máquina, con el requisito de tener un dispositivo rooteado conectado a esa máquina. Un
+servidor remoto no puede alcanzar por sí solo un USB enchufado en la PC de otra persona -- hace
+falta que algo del lado del usuario haga de puente. Investigando alternativas (reFrida, frida-ui,
+Frida-Script-Runner) se confirmó que frida SÍ se puede hablar desde el navegador (reFrida conecta
+directo a frida-server por WebSocket), lo cual reabrió la arquitectura: el navegador puede ser ese
+puente, reusando el handle `Adb` (Tango/ya-webadb) que el dashboard YA tiene para el video WebUSB.
+
+Decisión de diseño (túneles TCP crudos, ver plan completo en el historial de sesión): `frida`/`adb`
+reales siguen corriendo en el backend sin cambios de lógica -- se les apunta a listeners TCP locales
+que un tunnel manager nuevo multiplexa por WebSocket hacia el navegador, que reenvía los bytes al
+device real vía `adb.createSocket("tcp:PORT")`. Como el `serial` resuelto (`127.0.0.1:PA`) es
+indistinguible de un serial de red real (`ip:5555`) para el resto del código (`adb_transport.py`,
+`queue/engine.py`), TODA la maquinaria existente de adb-over-network (`ensure_available`,
+`TransportKeepAlive`, `_device_lock`) funciona sin tocarla.
+
+### Componentes nuevos
+
+- **`nutcracker_core/plugins/dashboard/relay.py`** (nuevo): `RelaySession` abre un listener TCP
+  loopback por túnel (`frida`, `adb`; puerto efímero, `port=0`) y multiplexa cada conexión aceptada
+  como un "canal" (`conn_id`) dentro de una sola WebSocket -- necesario porque frida abre varias
+  conexiones concurrentes contra frida-server, un socket 1:1 no alcanza. Protocolo: control en JSON
+  (`open`/`close`) + datos en frames binarios con header de 4 bytes big-endian = `conn_id`.
+  `RelayManager` registra sesiones por `session_id` (hoy: elegido libremente por el operador, ata la
+  conexión del navegador con los jobs que la usan).
+- **`plugins/dashboard/ws.py`**: nuevo endpoint `/ws/relay/{session_id}` -- el navegador se conecta
+  acá; usa `websocket.receive()` de bajo nivel (no `receive_text`/`receive_bytes`) porque mezcla
+  ambos tipos de frame en el mismo socket. Mismo manejo de `(WebSocketDisconnect, RuntimeError)` que
+  `ws_job`/`ws_chat`.
+- **`plugins/dashboard/api.py`**: `GET /api/relay/{session_id}` (estado + puertos). `QueuePayload`
+  gana `relay: bool`; `queue_add` con `relay=True` trata `serial` como el `session_id` de una sesión
+  YA conectada, la resuelve a `serial=127.0.0.1:PA` / `frida_host=127.0.0.1:PF`, y rechaza con 400 si
+  no hay navegador conectado ("no hay un navegador con el relay conectado para '<serial>'...").
+- **`queue/job.py`/`queue/engine.py`**: `Job.frida_host` (en memoria, mismo patrón que `source`);
+  `submit(frida_host=...)`; `_run_job` inyecta `NUTCRACKER_FRIDA_HOST` al env del subproceso si está
+  seteado. El engine queda deliberadamente ciego al relay -- solo transporta el valor ya resuelto por
+  `api.py` (capa correcta: `queue/` es core, `relay.py` vive en el plugin dashboard).
+- **`plugins/aipwn/aipwn.py`**: `_frida_host` ahora prioriza `NUTCRACKER_FRIDA_HOST` (env) sobre
+  `strategies.frida_host` (config) -- apunta frida al túnel de la corrida en vez del host fijo.
+- **`webusb/src/relay.ts`** (nuevo): `RelayClient` -- consume `/ws/relay/{session_id}`, reusa el
+  MISMO handle `Adb` que el video (`getAdb()`, nuevo export en `main.ts`; abrir un segundo handle
+  pisaría al del video, WebUSB es exclusivo por interfaz), abre `adb.createSocket("tcp:27042"|"tcp:5555")`
+  por cada canal que el backend anuncia, y bombea bytes en ambas direcciones. Re-exportado desde
+  `main.ts` para que `vite build` (modo lib, un solo entry) lo incluya en `webusb-video.bundle.js`.
+- **`static/index.html`**: sección "Relay" en la pestaña Dispositivo -- input de session id +
+  botones activar/detener, reusando la conexión USB ya activa.
+
+### Estado de verificación
+
+- **Backend: probado de verdad.** `tests/dashboard/test_relay.py` (13 tests, TCP loopback real, sin
+  mocks de socket) + `tests/dashboard/test_ws.py` (3 tests nuevos, integración completa vía
+  `TestClient` -- conexión TCP real contra el puerto anunciado, WebSocket real, round-trip de bytes
+  en ambas direcciones) + `tests/dashboard/test_api.py` (6 tests, gating de `queue_add`) +
+  `tests/test_queue_engine.py` (2 tests, inyección de env) + `tests/test_aipwn_relay_frida_host.py`
+  (4 tests, precedencia env > config > None). Suite completa: 337 tests pasan (los mismos 6 fallos
+  preexistentes sin relación).
+- **Frontend: compila y tipa correcto, NO verificado contra hardware.** `tsc --noEmit` limpio contra
+  los `.d.ts` reales de Tango (`AdbSocket`, `MaybeConsumable`); `vite build` genera el bundle con
+  `RelayClient`/`getAdb` exportados. Pendiente: probar `adb.createSocket()` contra un device físico
+  real (M1 de plan.md dice explícitamente "bootstrap manual" -- frida-server y `adb tcpip 5555` los
+  arranca el operador a mano por ahora, sin automatizar).
+
+### Pendiente (fuera de este cambio, ver plan.md completo)
+
+M2 (túnel adb en un run real end-to-end), M3 (bootstrap automático de frida-server/tcpip desde el
+navegador), M4 (reconexión/hardening). Multi-tenant (auth, aislamiento, API key por usuario)
+explícitamente diferido -- decisión del usuario, single-user primero.
+
+---
+
+## Fix de diseño: el túnel TCP crudo para adb no es viable -- pivot a RPC (M2, 2026-08-04)
+
+**Contexto:** probando M1 en vivo contra hardware real (deploy en 0.0.0.0 + mirrored networking +
+relay), el túnel de **frida** funcionó pero el de **adb** daba siempre `device offline` al instalar
+el APK. Diagnóstico en vivo, aislado del resto del pipeline (snippet directo en la consola del
+navegador contra `adb.createSocket("tcp:5555")`): la conexión resuelve OK (el device acepta el OPEN)
+pero después no fluye un solo byte -- ni error, ni cierre, silencio total, incluso escribiendo datos
+primero. Conclusión: **Android bloquea reenviar tráfico `tcp:` hacia el propio puerto de control de
+adbd (5555)** -- evita que una sesión adb ya autorizada se use para colarse al canal de control
+completo sin la RSA key de una PC autorizada. No es un bug del mecanismo `tcp:` en general: scrcpy
+(video, ya funcionando) usa exactamente el mismo mecanismo contra el puerto de scrcpy-server sin
+problema, porque ese es un proceso de terceros, no adbd. Mismo motivo por el que frida (27042) sí
+funciona -- frida-server tampoco es adbd.
+
+### Decisión
+
+Túnel TCP crudo se mantiene tal cual para **frida** (funciona, no se toca). Para **adb** se reemplaza
+por **RPC estructurado sobre la misma WebSocket**: el navegador resuelve las operaciones con los
+métodos NATIVOS de Tango (`adb.subprocess.spawnAndWait()`, `adb.sync()`) en vez de un socket crudo --
+confirmado que no es una técnica nueva sin probar: es el mismo mecanismo que ya usa scrcpy y que usa
+`app.webadb.com` (construida sobre la misma librería ya-webadb/Tango) para shell/install/pull.
+
+Alcance por etapas (decisión explícita del usuario: "por etapas, empezando por shell" en vez de las
+4 piezas juntas, para poder aislar fallas una por una como pasó con el túnel crudo). **Etapa 1 (esta
+sesión): solo `shell`.** `install`/`pull`/`push`/`exec-out`/`logcat` quedan pendientes de etapas
+siguientes -- fallan explícito con mensaje claro en vez de colgarse o dar "device offline" confuso.
+
+### Componentes nuevos
+
+- **`relay.py`**: `RelaySession.rpc(op, **fields)` -- manda `{"type":"rpc_request","request_id":N,...}`
+  y espera `{"type":"rpc_response","request_id":N,...}` correlacionado (dict de Futures por
+  request_id). `RpcTimeoutError`/`RpcError`/`RelayError` distinguen timeout, fallo reportado por el
+  navegador, y sesión no conectada. `detach_websocket()`/`stop()` fallan cualquier RPC pendiente en
+  vuelo en vez de dejarlo colgado hasta agotar su timeout completo.
+- **`api.py`**: `POST /api/relay/{session_id}/rpc/shell` (`async def`, awaits `session.rpc(...)`) --
+  mapea `RpcTimeoutError→504`, `RpcError→502`, `RelayError→409`.
+- **`relay.ts`**: `handleRpcRequest()` -- op `"shell"` resuelve con `adb.subprocess.spawnAndWait(command)`
+  (API real de Tango: `{stdout, stderr, exitCode}`), responde con `rpc_response`.
+- **`toolbox/relay_adb_shim/adb`** (nuevo, ejecutable con shebang): intercepta CUALQUIER invocación
+  de "adb" del resto del código sin tocar esos call sites -- `engine.py::_run_job` antepone su
+  directorio al `PATH` del subproceso cuando `job.relay_session_id` está seteado, así todo lo que
+  resuelva "adb" vía `shutil.which()` (aipwn.py, frida_capture.py, frida_agent_tools.py) lo recoge
+  automático. Traduce `adb -s <ignorado> shell <cmd...>` a un POST a
+  `/api/relay/{NUTCRACKER_RELAY_SESSION_ID}/rpc/shell`, junta los tokens con espacios (mismo
+  comportamiento que adb real), y propaga stdout/stderr/exit_code tal cual. Cualquier subcomando que
+  no sea `shell` falla explícito (exit code 2, mensaje claro) -- no silencioso.
+- **`queue/job.py`**: `Job.relay_session_id` -- a diferencia de como se diseñó `frida_host`/`serial`
+  originalmente, ACÁ `serial` deja de reescribirse a una dirección de loopback (`api.py::queue_add`
+  ya no lo hace) -- queda como el session_id tal cual, porque el shim lo ignora igual y así
+  `is_network_serial()` no lo confunde con un serial de red real.
+- **`queue/engine.py`**: `_ensure_transport()` gana un skip explícito para `job.relay_session_id`
+  (doble resguardo, por si el operador elige un session_id con forma `ip:puerto`). `_run_job` inyecta
+  `NUTCRACKER_RELAY_SESSION_ID` + antepone `_RELAY_ADB_SHIM_DIR` al `PATH`.
+
+### Verificación
+
+23 tests nuevos: `test_relay.py` (RPC round-trip, timeout, error del navegador, desconexión a mitad
+de request, dos RPCs concurrentes con request_ids independientes), `test_api.py` (mapeo de status
+codes del endpoint, con un doble de sesión -- una WebSocket real + POST concurrente desde otro hilo
+choca con una limitación conocida del TestClient de Starlette, deadlock del harness confirmado en
+vivo, no del código real), `test_queue_engine.py` (env vars + PATH, skip de `_ensure_transport`),
+`test_relay_adb_shim.py` (el shim como subproceso real contra un servidor HTTP de juguete: round-trip,
+exit code no-cero, sin `-s`, comando de un solo token pre-armado sin romper, comando no soportado
+falla explícito, env vars faltantes, error HTTP del dashboard, dashboard inalcanzable). Suite completa:
+360 tests pasan (los mismos 6 fallos preexistentes sin relación).
+
+**Pendiente de verificación en vivo** (requiere al usuario, con hardware real): la Etapa 1 (`shell`)
+compila y pasa todos los tests locales, pero todavía no se probó contra un device físico end-to-end.
+
+---
+
+## Verificación en vivo del relay contra hardware real (job 2819, 2026-08-04)
+
+**Resultado: parcialmente exitoso.** Primera corrida end-to-end de aipwn completa a través del relay
+(dashboard en 0.0.0.0 + mirrored networking + WebUSB en una PC distinta a la del backend):
+
+- ✅ **Túnel de frida vía CLI** (`frida -H 127.0.0.1:PF -f pkg -l script.js`, engine A): conectó,
+  spawneó la app, corrió el script, capturó resultado -- funciona end-to-end contra un device real.
+- ✅ **Shell RPC (Etapa 1)**: `check_app_installed`, lectura de clases decompiladas, y demás
+  operaciones vía el shim funcionaron sin errores de transporte durante toda la sesión.
+- ✅ **Fallo explícito para comandos no soportados**: `logcat`/`pull` (no implementados todavía)
+  fallaron con el mensaje claro diseñado ("comando 'X' todavía no soportado vía relay"), sin colgarse
+  ni dar el "device offline" confuso de antes -- el agente LLM los interpretó correctamente como una
+  limitación del entorno y siguió adaptando su estrategia.
+- ✅ El fix de JSON truncado de una sesión anterior también se vio funcionar en vivo: un script
+  truncado por el LLM se manejó sin crashear, el agente reintentó con uno más corto.
+- ❌ **Deadlock confirmado en `run_frida_script(spawn_gated=True)`** (engine B, bindings de Python de
+  frida -- `device.spawn()`/`device.attach()`, NO la CLI): la app real (`com.krealo.tenpo`) tiene RASP
+  nativo agresivo (`libh5t5cr7.so`, DexGuard/HST) que mata el proceso antes de que los hooks Java
+  instalen, así que el agente escaló a `spawn_gated=true` como estrategia -- y esa corrida se colgó
+  indefinidamente (16+ min sin progreso, 0% CPU, conexión TCP establecida con colas tx/rx vacías y sin
+  cambios -- deadlock de aplicación confirmado, no transferencia lenta). Es la PRIMERA vez que se
+  ejercita este camino contra el relay; la CLI (misma sesión, mismo target) funcionó bien.
+
+### Causa raíz: NO CONFIRMADA
+
+Diagnóstico intentado en vivo: `py-spy dump --pid <pid>` para un stack trace real de Python -- bloqueado
+por `ptrace_scope=1` del kernel, requiere `sudo` con password interactiva no disponible en este entorno.
+Sin eso, no hay evidencia directa de en qué línea exacta está bloqueado. Revisión de `relay.py` buscando
+un bug obvio de multiplexado para una segunda conexión concurrente no encontró nada evidente, pero eso
+no descarta que el problema esté ahí -- podría también ser un patrón de conexión distinto del lado de los
+bindings de frida-python que el relay no maneja igual que la CLI.
+
+**Decisión: no aplicar un fix especulativo sin evidencia** (mismo error que casi se repite del episodio
+de `tcp:5555` -- ahí sí hubo verificación en vivo antes de declarar la causa; acá todavía no la hay).
+Job 2819 matado manualmente y marcado `error` en la DB con el diagnóstico completo.
+
+### Próximo paso (cuando se retome)
+
+Conseguir un stack trace real la próxima vez que se reproduzca -- con `sudo` disponible para `py-spy`,
+o alternativa: correr aipwn con `FRIDA_DEBUG`/logging verboso de frida-python para ver en qué llamada de
+red exacta se cuelga. Mientras tanto: **usar el camino CLI (sin `spawn_gated=true`) como el confiable vía
+relay** -- es el que cubre la mayoría de los casos; `spawn_gated` es una estrategia de escalada del
+agente para RASP nativo agresivo específicamente, no el camino principal.
+
+**Actualización -- segunda reproducción idéntica (job 2820, mismo día):** el job 2820
+(`sh.nutcracker.nutbank`, app distinta a la del 2819) llegó también a `run_frida_script(spawn_gated=True)`
+por primera vez en esa corrida (diagnóstico del agente sobre si los hooks nativos disparaban el RASP) y
+se colgó exactamente igual -- conexión TCP establecida, colas tx/rx vacías y sin cambios, 0% CPU, 8+ min
+sin progreso. Mismo patrón: es la PRIMERA vez que ESA corrida usa `spawn_gated`, igual que en el 2819.
+Esto sube la confianza de que el problema es **sistemático del camino spawn_gated/bindings vs. el
+relay**, no una casualidad de una app en particular. Matado manualmente y marcado `error` en la DB. Sigue
+sin causa raíz confirmada (mismo bloqueo de `py-spy`/`sudo`) -- pero con 2/2 reproducciones limpias, es
+la pieza de mayor prioridad para la próxima sesión con acceso a mejores herramientas de diagnóstico.
+
+---
+
+## Etapas 2-4 del relay: install, pull, screencap (2026-08-04)
+
+Continuación directa de la Etapa 1 (shell), disparada por un caso real en vivo: el job 2820
+(`sh.nutcracker.nutbank`) necesitaba `pull_apk_from_device` para inspeccionar librerías nativas
+sospechosas de RASP, y el agente vio explícito el mensaje "comando 'pull' todavía no soportado" -- la
+señal de que tocaba seguir con el plan por etapas.
+
+### Diseño
+
+Mismo patrón que shell: RPC estructurado sobre `session.rpc(op, **fields)`, resuelto en el navegador con
+métodos NATIVOS de Tango -- nunca el túnel TCP crudo (que ya sabemos bloqueado para el puerto de control
+de adbd).
+
+- **`install`/`install-multiple`**: el shim lee el/los APK(s) local(es), los manda en base64 en un solo
+  `rpc_request`. El navegador sube cada uno a `/data/local/tmp/<nombre>` con `adb.sync().write()` (el
+  mismo método que usa `AdbScrcpyClient.pushServer` para subir el propio server de scrcpy -- no una
+  técnica nueva), corre `pm install[-multiple] <flags> <rutas>` con `adb.subprocess.spawnAndWait()`, y
+  borra los temporales (best-effort, un fallo de cleanup no debe tumbar una instalación ya exitosa).
+- **`pull`**: el navegador lee el archivo remoto con `adb.sync().read()`, lo manda entero en base64 en
+  un solo `rpc_response` (sin streaming por chunks -- explícitamente diferido, ver "Pendiente" abajo). El
+  shim lo escribe en la ruta local que pidió el caller.
+- **`screencap`** (`exec-out screencap -p`, único uso real de `exec-out` en el codebase -- no se
+  generalizó a comandos arbitrarios): usa `adb.subprocess.spawn()` (NO `spawnAndWait`, que decodifica
+  stdout como texto UTF-8 y corrompería el PNG binario) para leer el stream crudo de bytes. El shim
+  escribe con `sys.stdout.buffer.write()`, no `sys.stdout.write()`, por el mismo motivo.
+- Helpers nuevos en `relay.ts`: `bytesToBase64`/`base64ToBytes` (btoa/atob operan sobre "binary strings",
+  no directo sobre `Uint8Array`, de ahí la conversión manual troceada en chunks de 0x8000 para no reventar
+  el límite de argumentos de `String.fromCharCode(...arr)` con archivos grandes), `readAllBytes` (junta
+  un `ReadableStream<Uint8Array>` entero en memoria).
+- `api.py` ganó `_require_attached_relay_session()`/`_run_relay_rpc()` -- el chequeo de sesión conectada
+  y el mapeo de errores (`RpcTimeoutError→504`, `RpcError→502`, `RelayError→409`) estaban duplicados
+  4 veces, factorizado a dos helpers reusados por los 4 endpoints RPC.
+
+### Verificación
+
+14 tests nuevos: `test_relay_adb_shim.py` (install single/multiple APK con verificación de base64
+correcto, archivo local faltante falla antes de contactar al dashboard, exit code no-cero propagado,
+pull escribe bytes exactos en el path local, pull sin argumentos suficientes falla explícito, exec-out
+screencap escribe bytes binarios crudos a stdout -- incluyendo bytes no-UTF8 a propósito para probar que
+no se corrompen -- exec-out con comando no soportado sigue fallando explícito), `test_api.py` (6 tests,
+mapeo de status codes de los 3 endpoints nuevos, mismo patrón de doble de sesión que shell). Frontend:
+`tsc --noEmit` limpio contra los tipos reales de `AdbSync`/`AdbSubprocess` (tuvo que ajustarse a los tipos
+propios de `@yume-chan/stream-extra`, distintos del `ReadableStream` global del navegador aunque
+estructuralmente parecidos), `vite build` genera el bundle actualizado. Suite completa: 374 tests pasan
+(los mismos 6 fallos preexistentes sin relación).
+
+**Pendiente de verificación en vivo**: igual que la Etapa 1 en su momento, este código compila y pasa
+tests locales pero install/pull/screencap todavía NO se probaron contra hardware real -- pull en
+particular es justo lo que el job 2820 necesitaba, buen candidato para la próxima verificación en vivo.
+
+### Fuera de alcance de esta pasada (deferred a propósito)
+
+- **`push`/`logcat`** (streaming continuo): no encajan en el modelo pedido-respuesta de `rpc()` tal como
+  está. `logcat` en particular sigue fallando explícito -- el agente ya demostró en el job 2820 que lo
+  maneja bien sin romperse.
+- **Streaming real de archivos grandes** para pull/install: hoy todo el archivo se junta en memoria y se
+  manda en un solo mensaje base64. Suficiente para APKs/librerías nativas típicas (cientos de KB a pocos
+  MB); un archivo genuinamente grande sería una optimización a futuro, no bloqueante ahora.
+
+---
+
+## FIX RAÍZ: el túnel de frida vía Tango no sostenía el handshake WebSocket -- resuelto con un bridge WS nativo (2026-08-04)
+
+**El hallazgo más importante de toda esta sesión de relay.** Todo lo anterior (M1, la verificación "en
+vivo" del job 2812/2815/2819) daba por buena la CLI de frida por túnel crudo (`adb.createSocket("tcp:27042")`)
+solo porque el log mostraba "Connected"/"Spawning" -- **nunca se verificó que algo real volviera del
+device**. El usuario notó, mirando la pantalla real del teléfono, que ninguna app cambiaba de
+comportamiento pese a esos logs "exitosos". Eso disparó una investigación a fondo que terminó en un
+hallazgo real, no una sospecha.
+
+### Diagnóstico (instrumentación byte-a-byte, no conjetura)
+
+Se agregó logging temporal en `relay.py` (`_debug_log`, gateado tras `NUTCRACKER_RELAY_DEBUG=1`) para
+ver exactamente qué bytes cruzan el túnel en cada dirección. Con eso, un test aislado (`frida -H
+127.0.0.1:PF -f pkg -l script.js` con un script de dos líneas, sin aipwn de por medio) mostró:
+
+```
+conn=1 tunnel=frida local->ws 177 bytes: b'GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-W...'
+13ms después: navegador reporta 'closed'
+```
+
+**Frida moderno (17.x) no habla el protocolo TCP crudo histórico de frida-server -- habla WebSocket.**
+El CLI arma a mano un `GET /ws HTTP/1.1` con upgrade a WebSocket, y después manda/espera frames WS
+crudos por el mismo socket TCP. El túnel entregaba esos 177 bytes PERFECTOS al device (confirmado
+byte a byte) -- el problema es que `adb.createSocket("tcp:27042")` (Tango) no sostiene la conexión más
+de ~13ms después de ese handshake. No es el bug de `tcp:5555`/adbd (puerto de control) -- 27042 es
+frida-server, un proceso de terceros normal; es específico de cómo Tango maneja una conexión que
+arranca con un upgrade HTTP/WebSocket.
+
+Se descartó "no hay forma de aislar esto" con dos tests aislados más, directo en la consola del
+navegador contra `frida-server`:
+1. `adb.createSocket("tcp:27042")` + escribir bytes de prueba → mismo patrón (conecta, después
+   silencio total) -- confirma que el bug es de Tango, no de aipwn ni de mi relay.py.
+2. `new WebSocket("ws://192.168.1.42:27042/ws")` (nativo del navegador, **sin Tango, directo por la
+   LAN**) → conecta y se **mantiene estable** -- confirma que frida-server funciona bien, el problema
+   es específicamente el camino Tango/ADB.
+
+El usuario aportó la pista decisiva: **reFrida** (la IDE web de referencia investigada al principio de
+esta sesión) nunca usa Tango/ADB para frida -- se conecta con un `WebSocket` nativo del navegador
+directo a la IP de LAN del device (`ws://192.168.1.42:27042`), y el navegador pide el permiso "Acceso a
+Red Local" (Private Network Access de Chrome) la primera vez. Eso es justo lo que el test aislado #2
+confirmó que funciona.
+
+### Fix: bridge de protocolo WS crudo <-> WebSocket nativo (`relay.ts`)
+
+No alcanza con "usar `WebSocket` nativo en vez de `createSocket`" -- `frida` habla su protocolo WS A
+MANO sobre bytes crudos (arma el handshake HTTP él mismo, después manda/espera frames WS crudos),
+mientras que el objeto `WebSocket` del navegador hace SU PROPIO handshake y framing internamente, sin
+exponer bytes crudos. Hace falta un traductor completo (RFC 6455, subset) en el medio:
+
+- `_FridaWsChannel` (nuevo, junto a `_TangoChannel` -- `_Channel` es ahora una unión discriminada por
+  `kind`): NO abre el `WebSocket` nativo apenas se anuncia el canal -- espera a ver los bytes crudos del
+  `GET /ws` que arma `frida`, le extrae el header `Sec-WebSocket-Key`.
+- `completeFridaWsHandshake`: con esa key, calcula `Sec-WebSocket-Accept` (`base64(SHA1(key +
+  "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`, vía `crypto.subtle.digest("SHA-1", ...)` nativo del
+  navegador), abre el `WebSocket` nativo real hacia `ws://<ip-lan-device>:27042/ws`, y una vez que ESE
+  conecta, sintetiza a mano la respuesta HTTP 101 que `frida` espera recibir de vuelta por el canal
+  crudo -- como si viniera de un frida-server real.
+- De ahí en más: cada frame WS que manda `frida` (parseado con `parseClientWsFrame` -- enmascarado, por
+  spec de cliente) se desenmascara y su payload se manda por el `WebSocket` nativo
+  (`ch.ws.send(payload)`); cada mensaje que llega del `WebSocket` nativo (`onmessage`) se re-empaqueta
+  como frame WS de servidor (`buildServerWsFrame` -- sin máscara, por spec de servidor) y se manda como
+  bytes crudos de vuelta a `frida` por el túnel. Pings de `frida` se responden con pong directo (no hace
+  falta ida y vuelta al device).
+- Requiere que el navegador tenga alcance de RED (no solo USB) al device -- input nuevo "IP LAN del
+  device" en la sección Relay del dashboard (`index.html`), que arma `fridaWsUrl` y se lo pasa al
+  constructor de `RelayClient`. El túnel de adb (shell/install/pull/screencap, vía Tango) no cambia --
+  ese no tiene este problema.
+- Limitación documentada: no reensambla frames de continuación (fragmentación WS) -- no se vio hacer
+  falta en las pruebas en vivo, los mensajes de control/RPC de frida son chicos.
+
+### Verificación: end-to-end contra hardware real, primera prueba
+
+El mismo test aislado (`frida -H 127.0.0.1:PF -f sh.nutcracker.nutbank -l script.js`, script de dos
+líneas) que antes se colgaba en silencio, con el bridge nuevo:
+
+```
+[RELAY-TEST] script cargado y ejecutando en el device - 2026-08-04T18:21:13.059Z
+Spawned `sh.nutcracker.nutbank`. Resuming main thread!
+[RELAY-TEST] Java.perform disparo correctamente
+```
+
+Confirmado además con una captura de pantalla real (vía el screencap RPC de la Etapa 3, primera vez que
+se usa en vivo también): la app "Nut Bank" corriendo de verdad en el device, mostrando SU PROPIO diálogo
+"Security Check Failed -- Dynamic instrumentation detected (Frida)" -- prueba visual directa de que la
+instrumentación llegó, se adjuntó, y la app la detectó. Es el mismo diálogo que el agente LLM del job
+2820 estaba razonando cómo bypassear -- ahora, con el transporte realmente funcionando, esas estrategias
+tienen una oportunidad real de funcionar.
+
+### Pendiente
+
+- No hay tests automatizados del parser/builder de frames WS (`parseClientWsFrame`/`buildServerWsFrame`)
+  -- no existe infraestructura de test para TS en `webusb/` (sin vitest/jest configurado). Validado por
+  ahora con `tsc --noEmit` + revisión manual del RFC 6455 + el test end-to-end en vivo de arriba. Si se
+  toca este código de nuevo, vale la pena montar vitest.
+- El deadlock de `spawn_gated` (bindings de Python, ver sección anterior) sigue sin retestear con el
+  bridge WS nuevo -- dado que el bug real estaba en el túnel crudo de Tango (que también usaba el camino
+  CLI, no solo bindings), es muy posible que este mismo fix lo resuelva también. Buen próximo test.
+- IP de LAN del device hardcodeada a mano por el operador en el dashboard -- podría autodetectarse
+  (`adb shell ip route`/`getprop` vía el shell RPC que ya funciona) en una iteración futura.
+
+---
+
+## Puntos de mejora encontrados revisando los jobs 2822/2823 (2026-08-04)
+
+Revisión post-mortem de la primera corrida exitosa de aipwn vía relay (job 2823, bypass completo de
+`sh.nutcracker.nutbank` confirmado con screenshot real). El bypass funcionó, pero el log mostraba varias
+ineficiencias -- 6 fixes aplicados:
+
+### 1. [ALTO] El paso "probar script previo" no pasaba `frida_host`
+
+`aipwn.py` Paso 1 (`launch_frida_capture()` para testear el script cacheado de una sesión anterior)
+pasaba `serial=serial` pero no `frida_host=_frida_host` -- con relay activo, caía a `frida -D <serial>`
+(busca device por USB) en vez de `-H 127.0.0.1:PF`, y fallaba siempre con "Device not found" pese a que
+el script cacheado hubiera funcionado. En el job 2823 esto le costó al agente 13 iteraciones de LLM
+re-explorando desde cero en vez de 0. Fix de una línea + test (`tests/test_aipwn_relay_frida_host.py`).
+
+### 2. [BAJO] `%detach` incompatible con frida 17.x
+
+`frida_capture.py` mandaba el meta-comando viejo `%detach\n` a la REPL para desconectarse limpio -- frida
+17.16.4 ya no lo reconoce ("Unknown command: detach"), y el error se tragaba en silencio, cayendo siempre
+al `terminate()`/`kill()` de más abajo (funcional pero no realmente "graceful"). El propio banner de la
+CLI documenta `exit/quit -> Exit` como el comando real -- reemplazado.
+
+### 3. [BAJO] 4 hooks GMS fallaban siempre en emuladores AOSP (ruido idéntico repetido)
+
+`frida_bypass.py` (`_HOOK_GOOGLE_PLAY`) intentaba `Java.use()` sobre 4 clases de Google Play Services
+(`GoogleApiAvailability`, `GoogleApiAvailabilityLight`, `DeferredLifecycleHelper`,
+`GooglePlayServicesUtilLight`) de forma independiente -- en un emulador AOSP sin GMS instalado, las 4
+fallaban con el mismo `ClassNotFoundException`, ensuciando `hooks_fallidos` con ruido repetido en cada
+corrida. Ahora se chequea UNA vez con la clase "ancla" (`GoogleApiAvailability`) y se saltan las 4 juntas
+si no está. Validado con `node --check` sobre el script generado completo (28KB, sintaxis JS real) +
+3 tests nuevos en `tests/test_frida_bypass_script.py` (primer archivo de tests para este módulo).
+
+### 4. [MEDIO] Falso positivo de cert-pinning OkHttp
+
+`detectors/certificate_pinning.py` marcaba `detected=True` con solo ver la clase `okhttp3.CertificatePinner`
+en el APK -- pero esa clase viene incluida en OkHttp y aparece en CUALQUIER app que use la librería, la
+use o no para pinning real. En el job 2822, un método dummy `NetworkClient.disableCertificatePinning()`
+que solo loguea (la app usa `HttpsURLConnection`, no OkHttp para pinning) disparaba el falso positivo, y
+el agente LLM perdió ~3 iteraciones descartándolo a mano. Fix: la clase `CertificatePinner` de OkHttp
+ahora es un indicador "ambiguo" que solo cuenta si viene acompañado de un hash de pin real (`sha256/`,
+NSC `<pin-set>`) -- los indicadores realmente inequívocos (TrustKit, `PinningTrustManager`,
+`PublicKeyPinning`) siguen bastando por sí solos. Bug encontrado ESCRIBIENDO el test:
+`"CertificatePin"` (sin "ner") en la lista de indicadores "fuertes" originales resultó ser PREFIJO
+literal de `"CertificatePinner"`, colisionando con el gate nuevo y anulándolo -- sacado. 7 tests nuevos
+en `tests/test_certificate_pinning_detector.py` (primer archivo de tests para este detector).
+
+### 5. [BAJO] `logcat` en modo streaming, implementado vía RPC
+
+Completa la Etapa 5 del relay (después de shell/install/pull/screencap). Diseño pragmático: NO es
+streaming línea-a-línea real -- el único consumidor real (`frida_capture.py::stream_logcat`) solo junta
+las líneas en una lista para razonar sobre ellas DESPUÉS de que termina la ventana de captura, nunca las
+usa mientras llegan. Así que alcanza con el mismo patrón pedido-respuesta que las otras Etapas: el
+navegador corre `logcat` (sin `-c`) durante una ventana acotada (`reader.cancel()` vía `setTimeout`, no
+`Promise.race` -- soltar el lock con un `read()` en vuelo es inseguro), junta todo lo capturado, y lo
+manda entero en un solo `rpc_response`. `logcat -c` (limpiar buffer, comando de una sola pasada) se
+reenvía tal cual al RPC de `shell` que ya existía -- no necesitaba nada nuevo. 9 tests nuevos (shim +
+endpoint).
+
+### 6. [ALTO] `get_app_analysis()` no veía las protecciones reales -- bug real, no falta de detección
+
+**El hallazgo más valioso de esta tanda.** El detector de RootBeer/anti-Frida (`KnownLibrariesDetector`)
+en sí funciona perfecto -- confirmado corriéndolo en vivo contra el APK real de `sh.nutcracker.nutbank`
+(`detected=True`, encontró las 7 clases de RootBeer sin problema). El bug estaba en
+`plugins/aipwn/__init__.py::_load_analysis_json()`: elegía el .json "más reciente" con
+`sorted(glob("*.json"), reverse=True)` y una lista negra de 3 nombres reservados
+(`vuln.json`/`osint.json`/`bypass_result.json`) para filtrar los que NO son un `AnalysisResult` real --
+pero esa lista no cubría `exploit_report_<package>.json` (escrito por el exploit agent, con orden
+alfabético que lo hace "ganar" el sort antes que los .json de análisis reales con nombre
+`<YYYYMMDD>_<HHMMSS>.json`). Ese archivo tiene una key `"package"` pero NO `"detections"` --
+`AnalysisResult.from_dict()` lo aceptaba en silencio como un análisis VACÍO (`results=[]`) en vez de
+tirar `KeyError`, así que `get_app_analysis()` reportaba "sin protecciones" pese a que el análisis
+estático real (guardado aparte) sí había encontrado RootBeer, anti-Frida y verificación de firma.
+**Afecta a CUALQUIER app con un exploit_report previo** -- es decir, después del primer bypass exitoso,
+cada corrida siguiente de aipwn perdía la detección estática por completo, forzando al agente a
+depender solo de memoria de sesiones pasadas o exploración a ciegas. Fix: en vez de mantener una lista
+negra que hay que actualizar cada vez que se agrega un nuevo tipo de reporte, se filtra por el patrón de
+nombre POSITIVO real que usa `reporter.save_analysis_json()` (regex `^\d{8}_\d{6}\.json$`), más un
+resguardo extra validando que el dict cargado tenga la key `"detections"` antes de aceptarlo. Verificado
+en vivo: `_load_analysis_json('sh.nutcracker.nutbank')` ahora carga 8 detectores con RootBeer/anti-Frida/
+firma correctamente detectados. 6 tests nuevos en `tests/test_aipwn_load_analysis_json.py`.
+
+### Verificación
+
+38 tests nuevos en total entre los 6 fixes. Suite completa: 395 tests pasan (los mismos 6 fallos
+preexistentes sin relación, ver fixes anteriores de esta sesión).
+
+## Auditoría: ¿se expone la API key del LLM al frontend? (2026-08-04)
+
+Pregunta del usuario tras la discusión de despliegue en VPS público. Verificado, no supuesto:
+
+- Cero referencias a `api_key`/`llm_cfg`/config del LLM en todo `nutcracker_core/plugins/dashboard/`
+  (backend y frontend, grep exhaustivo).
+- `/api/agent/prompt` solo devuelve el system prompt hardcodeado (`_SYSTEM_PROMPT`), nunca config.
+- `/api/config/default-serial` solo devuelve `strategies.default_device_id`.
+- El mount de `StaticFiles` apunta a `dashboard/static/`, un árbol de directorios separado de donde
+  vive `config.yaml` (raíz del repo) -- no hay forma de que ese mount lo sirva.
+- `build_job_cmd()` (orchestrator.py) para el job de aipwn nunca pasa la key por CLI args ni por env
+  inyectado desde el dashboard -- el subproceso `aipwn` lee `config.yaml` él mismo, server-side
+  (`llm_cfg = config.get("llm", {})` en `aipwn.py`).
+- Los logs del job SÍ se streamean en vivo al navegador (EventBus + `/ws/jobs/{id}`) -- pero no hay
+  ningún `print`/`console.print` que vuelque `config`/`api_key`/`client_args` crudos, y los mensajes de
+  error del LLM (`f"LLM error: {e}"` en `frida_agent.py`) usan `str(exception)` de los SDKs de
+  OpenAI/Anthropic, que no eco-an el header de Authorization en el texto del error.
+
+**Veredicto: confirmado seguro**, ningún endpoint ni ruta de logs expone la key. Sigue siendo una key
+única compartida en texto plano en `config.yaml` (problema de multi-tenancy, fuera de alcance mientras
+sea single-user -- ver sección de arquitectura del relay más arriba).
+
+## HTTPS para despliegue en VPS (2026-08-04)
+
+Usuario no tiene dominio propio ni VPS elegido todavía (eligió Ubuntu/Debian como SO). Se armó el setup
+en `deploy/` (Caddy -- TLS automático vía Let's Encrypt, renovación sola, proxea WebSocket sin config
+extra):
+
+- `deploy/Caddyfile` -- reverse proxy a `127.0.0.1:8765`.
+- `deploy/nutcracker-dashboard.service` -- unit de systemd, dashboard bindeado a `127.0.0.1` (NO
+  `0.0.0.0` como en uso local LAN) para que solo Caddy lo alcance; firewall bloquea el puerto directo.
+- `deploy/README.md` -- guía paso a paso, incluye recomendación de DuckDNS (subdominio gratis con DNS
+  real, válido para Let's Encrypt) ya que el usuario no tiene dominio propio comprado.
+
+Pendiente explícito documentado en el propio README: con esto el dashboard queda en HTTPS pero sigue
+**sin autenticación** -- cualquiera con la URL puede operarlo. Es el siguiente bloqueador real, no
+cubierto por este cambio.
