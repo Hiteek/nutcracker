@@ -1910,3 +1910,239 @@ todos mockeando subprocess/docker -- no requieren Docker instalado para correr e
   (gitleaks) -- mismo patrón, no hecho todavía.
 - Los subsistemas deferidos arriba (MCP server, device pool, mitmproxy addon, frida_scripts
   curados), si el usuario los pide explícitamente.
+
+---
+
+## Historial de análisis por app + descarga de reportes (2026-08-03)
+
+**Pedido:** ¿existe un histórico de evaluación por app y la posibilidad de descargar cada reporte?
+
+No existía en la UI, pero los datos ya estaban en la base (`runs` completo por paquete vía
+`repository.history()`, `artifacts` con rutas JSON/PDF vía `repository.artifacts_for_run()`) --
+solo faltaba exponerlo.
+
+### Implementado
+
+- `store_reader.list_runs_for_app(conn, package, limit=50)`: historial completo de runs de un
+  paquete, con conteo de hallazgos y artefactos (`{"json": path, "pdf": path}`) por run.
+- `GET /api/apps/{package}/runs` y `GET /api/runs/{run_id}/download/{json|pdf}` (este último sirve
+  el archivo real vía `FileResponse`, con 404 si el tipo es inválido, no hay artefacto registrado, o
+  el archivo ya no existe en disco).
+- Nueva sección "Historial de análisis" en el modal de detalle de app: fecha, veredicto, score,
+  hallazgos, y botones de descarga.
+
+### Decisión de diseño importante: el botón de PDF solo aparece en el run más reciente
+
+El PDF es un archivo **canónico por paquete** (`reporter.py` lo sobreescribe en cada análisis, ver
+`store/hooks.py::_find_artifacts` -- no genera un PDF distinto por run). Mostrar un botón "Descargar
+PDF" en un run viejo daría a entender que ese archivo corresponde a *ese* análisis puntual, cuando en
+realidad sería el contenido del análisis más reciente. El JSON sí es único por run (nombre con
+timestamp), así que ese botón se muestra siempre que exista. El endpoint de descarga no impone esta
+restricción (sirve lo que haya registrado para ese run_id, tal cual) -- la decisión de qué mostrar
+vive en el frontend.
+
+### Verificación
+
+- 6 tests nuevos en `tests/dashboard/test_api.py`. Suite completa: 278 tests pasan (6 fallos
+  preexistentes sin relación, ver sección de `dispatch_tool` más arriba).
+- Verificado en vivo contra el dashboard real: `/api/apps/com.bcp.bo.wallet/runs` devuelve el
+  historial real con artefactos, y `/api/runs/11/download/pdf` sirve un PDF válido (7 páginas,
+  14992 bytes) directamente desde disco.
+
+---
+
+## Hallazgos consolidados por app + navegación a hallazgos por corrida (2026-08-03)
+
+**Pedido:** ¿existe un consolidado de hallazgos por app de todas las corridas, y otro por corrida?
+
+Ninguno de los dos existía. Confirmé con datos reales (com.bcp.bo.wallet, runs #10/#11 -- mismo
+build re-analizado) que ambos runs tienen **hallazgos idénticos byte a byte** -- un consolidado sin
+deduplicar sería puro ruido (8 filas en vez de 4 reales).
+
+### Implementado
+
+- `store_reader.consolidated_findings_for_app(conn, package)`: deduplica por `(rule_id, file, line)`
+  a través de TODAS las corridas del paquete. Cada hallazgo distinto trae `status` ("present" si
+  sigue en el run más reciente, "resolved" si ya no) + `seen_in_runs` + `first_seen_at`/`last_seen_at`.
+  `repository.history()` devuelve runs más reciente primero, así que se recorre en ese orden: la
+  primera vez que aparece una clave es su `last_seen`, y se empuja `first_seen` hacia atrás a medida
+  que se la encuentra en runs más viejos.
+- `GET /api/apps/{package}/findings` -- expone lo anterior.
+- Nueva sección "Hallazgos consolidados" en el modal de app: estado (badge presente/resuelto),
+  regla, severidad, ubicación, veces visto, primera/última vez.
+- Historial de análisis ahora es **clickeable por fila**: `loadRunFindings(runId)` reemplaza la
+  tabla "Hallazgos del último run" (rebautizada dinámicamente a "Hallazgos del run #X") por los
+  hallazgos de ESE run puntual -- antes solo se podía ver el run más reciente sin forma de
+  inspeccionar corridas viejas.
+
+### Verificación
+
+- 3 tests nuevos en `tests/dashboard/test_api.py` (dedup, marcado resolved, caso vacío). Suite
+  completa: 281 tests pasan (6 fallos preexistentes sin relación, ver sección de `dispatch_tool`).
+- Verificado en vivo contra datos reales: `/api/apps/com.bcp.bo.wallet/findings` devuelve
+  correctamente 4 hallazgos distintos (no 8), cada uno con `seen_in_runs: 2` y `status: present`.
+
+---
+
+## Botón "reanudar +5 iteraciones" para sesiones de aipwn sin conclusión (2026-08-03)
+
+**Pedido:** un botón que, cuando aipwn se queda sin iteraciones, le dé 5 iteraciones más al job y
+continúe todo desde donde se quedó, recordando lo que hizo.
+
+### Diseño
+
+Distinto de `agent_memory.save_session()`/`load_sessions()` (ya existente): eso es un RESUMEN
+(hooks que funcionaron/fallaron, clases clave) para inyectar como contexto en una sesión NUEVA.
+Esto persiste la **conversación completa** (`self.messages` tal cual, con cada tool call y su
+resultado) para continuar literalmente la misma sesión, no empezar de cero con un resumen.
+
+`analysis_result`/`decompiled_dir` NO se persisten -- la CLI (`plugins/aipwn/__init__.py::aipwn_cmd`)
+ya los re-deriva frescos desde disco en cada invocación, así que reanudar simplemente los vuelve a
+cargar igual que una corrida normal.
+
+### Implementado
+
+- `agent_memory.save_resume_state()`/`load_resume_state()`/`clear_resume_state()`/`has_resume_state()`.
+- `FridaAgent.run()`: 3 cortes SIN conclusión ahora guardan estado reanudable (límite de
+  iteraciones, LLM sin tool_calls -- el caso real de `com.krealo.tenpo`/job 2801 -- y error de LLM
+  agotando reintentos). Un `report_success`/`report_failure` real limpia cualquier sesión pendiente
+  vieja: ahí sí hubo conclusión, no hay nada que continuar.
+- `FridaAgent.__init__(resume_state=..., extra_iterations=...)`: si hay `resume_state`, usa
+  `self.messages` guardados tal cual (no reconstruye el prompt inicial ni reinyecta memoria) y el
+  tope de iteraciones queda en `iteración_guardada + extra_iterations` (no vuelve al default de
+  config) -- "+5 iteraciones" son 5 de verdad, no 5 desde cero.
+- `nutcracker aipwn <pkg> --resume --extra-iterations 5` (CLI) → `orchestrator.build_job_cmd(...,
+  aipwn_resume=..., aipwn_extra_iterations=...)` → `QueueEngine.submit(..., aipwn_resume=...)` (nuevos
+  campos en memoria en `Job`, mismo patrón que `source`: no persisten en SQLite).
+- Dashboard: `GET /api/queue` marca `resumable: true` solo en el job aipwn **más reciente** de cada
+  target con sesión pendiente en disco (dos jobs viejos del mismo target no se marcan ambos -- la
+  sesión guardada es una sola, la de la corrida más reciente). `POST
+  /api/queue/{job_id}/resume-aipwn` encola una corrida nueva con `aipwn_resume=True` y dispara el
+  drenado en background (mismo `run_now` que el resto de la cola).
+- Botón "▶ +5 iteraciones" en la tabla de la cola, junto al de borrar -- solo visible si el job es
+  `resumable`.
+
+### Verificación
+
+- 20 tests nuevos (7 `agent_memory` resume, 5 `FridaAgent` resume, 8 dashboard). Suite completa: 301
+  tests pasan (6 fallos preexistentes sin relación).
+- Verificado en vivo contra el dashboard real: `/api/queue` devuelve `resumable: false` para el job
+  `2801` (`com.krealo.tenpo`, el caso real que motivó el pedido) -- correcto, corrió *antes* de este
+  fix, nunca se guardó su conversación. Cualquier corrida de aipwn que termine sin conclusión de acá
+  en adelante sí quedará reanudable.
+
+---
+
+## Fix: RuntimeError sin manejar en los WebSockets del dashboard (2026-08-03)
+
+**Reportado por el usuario:** traceback en el proceso del dashboard --
+`RuntimeError: Unexpected ASGI message 'websocket.send', after sending 'websocket.close'` en
+`ws.py::ws_job`.
+
+### Causa
+
+`ws_job`/`ws_chat` solo atrapaban `WebSocketDisconnect`. Un cliente que cierra la conexión justo
+cuando el servidor está por mandar un evento (p.ej. `goToJobLog()` en el frontend cierra el socket
+viejo y abre uno nuevo al hacer clic en otra fila del historial de análisis, feature agregada esta
+misma sesión) no siempre produce `WebSocketDisconnect` -- a veces Starlette/uvicorn ya cerró el
+transporte del lado ASGI y levanta un `RuntimeError` genérico al intentar mandar después. Sin
+atraparlo, tumbaba el `await self.app(...)` de uvicorn con un traceback completo en la consola del
+dashboard (aunque no mataba el proceso -- uvicorn aísla cada conexión).
+
+### Fix
+
+`ws_job` y `ws_chat` ahora atrapan `(WebSocketDisconnect, RuntimeError)` en vez de solo
+`WebSocketDisconnect`. De paso, en `ws_job` se movió `bus.subscribe()` a ANTES del `try` (en vez de
+después del replay de historial) -- así `bus.unsubscribe()` en el `finally` corre siempre, incluso si
+el primer `send_json()` del replay ya falla.
+
+### Verificación
+
+`TestClient.websocket_connect()` no reproduce esta carrera de forma determinística (es un timing real
+de la capa ASGI/transporte) -- los tests nuevos invocan `ws_job`/`ws_chat` directo con un WebSocket
+falso cuyo `send_json()` levanta el `RuntimeError` real visto en producción, confirmando que ya no
+propaga y que `bus.unsubscribe()` sigue corriendo. 4 tests nuevos en `tests/dashboard/test_ws.py`.
+Suite completa: 304 tests pasan (6 fallos preexistentes sin relación).
+
+---
+
+## Fix: la VM de WSL2 se caía entera al correr jadx vía el toolbox de Docker (2026-08-03)
+
+**Reportado por el usuario:** tras activar `toolbox.enabled: true` (para que aipwn dejara de estar
+ciego con `com.krealo.tenpo` -- ver fix anterior sobre `.smali` vs `.java`), el sistema entero se
+congelaba/reiniciaba corriendo `jadx --deobf` contra ese APK vía Docker, tumbando el dashboard y
+dejando el job huérfano (`running` en SQLite, sin proceso vivo). Pasó dos veces.
+
+### Causa
+
+Docker Desktop en modo "WSL2 based engine" (confirmado vía `dmesg`:
+`docker-desktop-user-distro proxy --distro-name Ubuntu`) comparte el MISMO pool de memoria de la VM
+de WSL2 que la distro principal donde corre nutcracker -- no son VMs independientes. Sin
+`.wslconfig`, ese pool es ~50% de la RAM del host (7.7GB en esta máquina de 16GB). El contenedor de
+`toolbox/client.py::run()` no tenía ningún límite propio de memoria (`docker run` sin `--memory`), así
+que un `jadx --deobf` desbocado contra un APK grande/ofuscado podía consumir memoria sin techo hasta
+agotar TODO ese pool compartido -- llevándose puesto con él al dashboard y cualquier otro job, en vez
+de fallar solo el contenedor.
+
+Primer intento de fix (`/mnt/c/Users/Hitee/.wslconfig` con `memory=10GB, swap=4GB`, el host tiene
+16GB) subió el techo compartido -- verificado en vivo (`docker info` "Total Memory" pasó de 7.695GiB
+a 9.713GiB en lockstep con el cambio) -- pero no fue suficiente: la demanda real de `jadx --deobf`
+contra ese APK en particular superó igual el nuevo techo, esta vez agotando el swap (`dmesg`: `Free
+swap = 0kB` repetido) a los ~6 minutos de un boot limpio de WSL2.
+
+### Fix
+
+El fix de fondo era el que faltaba: ponerle techo propio al contenedor, no solo al pool compartido.
+`toolbox/client.py::run()` ahora agrega `--memory {limit} --memory-swap {limit}` al `docker run` (la
+misma cifra en ambos flags le niega swap adicional al contenedor: si se pasa del límite, el kernel lo
+mata rápido por su propio cgroup en vez de dejarlo entrar en swap thrashing, que es justamente lo que
+pone lenta/inestable a toda la VM antes de que ocurra ningún OOM-kill real). Límite configurable vía
+`toolbox.memory_limit` en `config.yaml` (default `'4g'` -- dado el pool actual de ~9.7GB, deja margen
+para el propio proceso de nutcracker + el resto del sistema, y el contenedor ya no puede por sí solo
+agotar todo el pool).
+
+### Verificación
+
+3 tests nuevos en `tests/test_toolbox_client.py` (`memory_limit()` default/override, `--memory`/
+`--memory-swap` en el comando `docker run` construido, override real vía config). Jobs huérfanos por
+los crashes anteriores (2804, 2805, 2806) limpiados manualmente a `status='error'`. Confirmado en vivo
+tras el fix: sin procesos ni jobs `running` colgados en el sistema.
+
+---
+
+## Fix: mensaje con JSON truncado quedaba pegado en el historial del LLM para siempre (2026-08-03)
+
+**Reportado por el usuario:** log del job `2809` (`com.krealo.tenpo`) -- el agente diagnosticaba bien
+el bypass (classloader-level hooking de `HSTSecNative`/`HSTSecurity`), pero al llamar al LLM en la
+iteración 23 el proveedor (Azure) devolvía 400 `"Assistant tool call function.arguments must be valid
+JSON"` -- **idéntico en los 3 reintentos**, matando el job entero (`✘ Bypass failed`).
+
+### Causa
+
+Relacionado con el fix anterior del `KeyError: 'script_js'`, pero más de fondo: en
+`LLMClient._do_completion()` (`nutcracker_core/plugins/aipwn/frida_agent.py`), cuando el modelo
+devuelve JSON truncado para un tool call, el `try/except json.JSONDecodeError` (líneas ~464-468) SÍ
+corregía el valor a `{}` -- pero solo para el `_ToolCall` usado en el despacho local. El
+`raw_message` que se guarda en `self.messages` (el historial que se reenvía en cada llamada
+siguiente) releía `tc.function.arguments` **crudo, directo del objeto del SDK**, en un bloque de
+código totalmente separado que nunca pasaba por ese try/except. El fix del `KeyError` (que atrapa el
+crash al despachar la tool) no tocaba esto -- el mensaje del asistente con el JSON roto ya había
+quedado guardado en el historial ANTES de que `dispatch_tool` corriera. A partir de ahí, cada
+`self.llm.chat(self.messages, ...)` reenviaba ese mismo mensaje estructuralmente inválido, y Azure lo
+rechazaba siempre igual -- no es un error transitorio, así que reintentar no ayuda, y el resto de la
+sesión (todo lo que el agente ya había descubierto sobre `com.krealo.tenpo`) se perdía.
+
+### Fix
+
+`_do_completion()` ahora sanea el `arguments` de cada tool call UNA sola vez (dict `sanitized_args_json:
+{tc.id: json_string_válido}`, `"{}"` si falló el parseo) y ese mismo valor se usa tanto para construir
+el `_ToolCall` de despacho local como para el `raw_message` que se guarda en `self.messages` -- las dos
+lecturas independientes de `tc.function.arguments` que antes podían divergir ahora comparten una sola
+fuente de verdad. El JSON truncado del modelo nunca vuelve a persistir en el historial.
+
+### Verificación
+
+3 tests nuevos en `tests/test_aipwn_llm_client_tool_call_json.py`: JSON válido queda intacto, JSON
+truncado se sanea a `{}` tanto en el historial como en el despacho local (y ambos coinciden). Suite
+completa: 309 tests pasan (los mismos 6 fallos preexistentes sin relación, ver fix anterior de
+`.smali`/toolbox).
