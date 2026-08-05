@@ -2927,3 +2927,42 @@ este).
 ejercitar la función real `try_gadget_inject` de punta a punta, confirmando las 2 invocaciones de
 apktool vía toolbox Y que `work_dir` queda bajo `scratch_dir()`). Suite completa: 435 pasan (los
 mismos 6 fallos preexistentes sin relación).
+
+## Bug real de raíz: relay_session_id/frida_host no se persistían (2026-08-05)
+
+Reportado en vivo: job aipwn contra `sh.nutcracker.nutbank` (app SÍ instalada en el dispositivo real,
+conectado por WebUSB, sesión de relay confirmada `attached: true` vía `/api/relay/<id>`) fallaba
+igual con "App ... not installed on device" -- incluso reencolando con "vía relay" tildado. Diagnóstico
+metódico (no adivinado): revisado el log, el pipeline de auth del relay, el shim de adb, hasta llegar a
+`engine.py::_load_queued_from_db()`.
+
+**Causa raíz confirmada**: `Job.relay_session_id`/`Job.frida_host` estaban documentados como "solo en
+memoria, mismo motivo que `source`" -- pero a diferencia de `source`/`aipwn_resume` (que si se pierden
+caen a un fallback ACEPTABLE, ver sus propios comentarios), perder el relay no degrada con gracia: el
+job recargado desde SQLite queda con `relay_session_id=None`, el PATH del subproceso nunca se apunta al
+shim de adb (`engine.py::_run_job`, gateado por `if job.relay_session_id:`), y aipwn termina hablándole
+a un `adb` real de la VM sin ningún dispositivo detrás -- de ahí el síntoma engañoso ("not installed")
+sin ningún error que apunte a la causa real. `enqueue_job()`/`_load_queued_from_db()` nunca
+persistían/releían estas dos columnas -- ni siquiera EXISTÍAN en el esquema de `queue_jobs`.
+
+Se pierden en cualquier reconstrucción desde DB de un job todavía 'queued' cuando el proceso del
+dashboard se reinicia -- pasó varias veces en esta misma sesión por otros fixes (`systemctl restart
+nutcracker-dashboard`), coincidiendo con la ventana entre que el usuario encoló el job y que corrió.
+
+**Fix**: migración 3 en `store/db.py` (`ALTER TABLE queue_jobs ADD COLUMN relay_session_id/frida_host`,
+`SCHEMA_VERSION` 2→3, verificada en vivo sobre una DB simulando el esquema viejo real -- filas
+preexistentes sobreviven con NULL, sin pérdida de datos); `repository.enqueue_job()` ahora acepta y
+persiste ambos campos; `engine.py::submit()` los pasa; `engine.py::_load_queued_from_db()` los relee al
+reconstruir el `Job`. Comentarios de `queue/job.py` actualizados (ya no dicen "solo en memoria").
+
+**Verificación**: reproducido el bug exacto en vivo ANTES del fix (proceso 2 con engine nuevo perdía
+`relay_session_id` tras simular un reinicio) y confirmado el fix DESPUÉS (mismo script, ahora sobrevive
+intacto). 4 tests nuevos en `tests/test_queue_engine.py`: persistencia directa a SQLite, el escenario
+completo de "reinicio del dashboard" con un job relay-backed, y retrocompatibilidad (job sin relay
+sigue reconstruyéndose con `None`, no inventa un valor). Suite completa: 438 pasan (los mismos 6 fallos
+preexistentes sin relación).
+
+**Para el usuario**: en la VM, `git pull` + reiniciar el servicio aplica la migración sola (se corre
+automáticamente en `db.connect()`, no hace falta ningún paso manual). Reencolar el job de
+`sh.nutcracker.nutbank` con "vía relay" + el session id debería funcionar ahora incluso si el dashboard
+se reinicia entre que se encola y que corre.
