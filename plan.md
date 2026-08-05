@@ -2745,3 +2745,27 @@ tag `latest` real vía la API de GitHub (`api.github.com/.../releases/latest`), 
 fijo si la API no responde (rate limit/sin red). Asset corregido a `-gnu`. Verificado en vivo: la
 versión se resuelve a `1.0.0`, el binario descarga y corre (`apkeep --version`, `apkeep --help`
 confirma el mismo shape de CLI).
+
+## Fix #2 en el mismo bloque de apkeep: curl:(23) real, y uno cosmético (2026-08-05)
+
+Usuario reportó `curl: (23) Failure writing output to destination` corriendo `setup.sh` de nuevo tras
+el fix anterior -- pero corriendo como root. Eso descarta el permiso de `/usr/local/bin` como causa de
+ESE mensaje puntual (aunque el fallback a `~/.local/bin` para usuarios no-root sigue siendo válido y se
+mantiene, ver abajo). Diagnóstico correcto reproducido en vivo: `curl ... | grep -m1 ... | sed ...` --
+`grep -m1` corta la lectura apenas encuentra el primer match y cierra su extremo del pipe; curl, que
+todavía está escribiendo el resto del JSON, recibe SIGPIPE y reporta exactamente
+"curl: (23) Failure writing output to destination, passed N returned M" -- cosmético (el valor ya
+había sido capturado antes del corte) pero indistinguible a simple vista de un error real, confundió
+al usuario con razón.
+
+Dos fixes en el mismo bloque de `setup.sh`:
+1. **Permisos** (para usuarios no-root, sigue siendo válido): si `/usr/local/bin` no es escribible,
+   cae a `~/.local/bin` (creándolo si hace falta) y avisa si ese directorio no está en `$PATH`.
+2. **El pipe roto** (la causa real de lo reportado corriendo como root): `curl` ahora se captura
+   primero entero en una variable (`$(...)` lee hasta EOF, sin pipe en vivo hacia grep) y RECIÉN
+   DESPUÉS se le hace `grep -m1` sobre la variable ya completa -- curl nunca queda escribiendo a un
+   pipe que se cierra a mitad de camino.
+
+Verificado en vivo (reproducido el mensaje cosmético primero para confirmar la causa, después
+confirmado que el fix lo elimina): misma versión resuelta (1.0.0), mismo binario descargado y
+funcional (`apkeep --version`), cero mensajes `curl:(23)` de ningún tipo.
