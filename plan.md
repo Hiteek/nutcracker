@@ -2999,3 +2999,33 @@ usando el fake HTTP server ya existente en el archivo, extendido para capturar h
 **Para el usuario**: en la VM, `git pull` + `sudo systemctl restart nutcracker-dashboard`. Con los dos
 fixes de esta sesión (persistencia + token del shim), reencolar el job de `sh.nutcracker.nutbank` vía
 relay debería funcionar de punta a punta ahora.
+
+## El batchero y resume-aipwn tampoco soportaban relay (2026-08-05)
+
+Pregunta del usuario tras confirmar que aipwn individual y el análisis estático ya funcionaban bien vía
+relay: "el batchero tendrá problemas?". Auditado -- sí, gap real y confirmado por código (no supuesto):
+
+- `QueueBatchPayload` no tenía campo `relay` (ni el frontend el checkbox correspondiente) -- no había
+  forma de pasarle una sesión de relay al batch, ni a los jobs estáticos ni al aipwn que
+  `then_aipwn=true` encadena después de cada uno.
+- De paso, mientras se revisaba esto, se encontró un TERCER lugar con el mismo gap:
+  `POST /api/queue/{id}/resume-aipwn` (botón "+N iteraciones") tampoco preservaba
+  `relay_session_id`/`frida_host` de la corrida original -- gracias al fix de persistencia de antes
+  (migración 3), ahora esos campos SÍ están disponibles en la fila de la DB, así que el fix acá fue
+  trivial: simplemente leerlos y pasarlos.
+
+**Fix**: extraída `_resolve_relay(serial, relay)` de `queue_add` (antes tenía la validación/mensajes de
+error inline) para que `queue_batch` la reuse exactamente igual, sin una copia que se desincronice.
+`QueueBatchPayload.relay` nuevo; `queue_batch()` resuelve la sesión una vez y la propaga a cada
+`engine.submit()` estático; `_drain_batch_in_background()` ahora recibe `relay_session_id`/`frida_host`
+y los propaga también al aipwn encadenado. `queue_resume_aipwn` lee `job["relay_session_id"]`/
+`job["frida_host"]` de la fila original. Frontend: checkbox "vía relay" nuevo en la fila del batch
+(mismo patrón que el de la cola individual), placeholder del campo serial actualizado.
+
+**Verificación**: 6 tests nuevos (`test_api.py`): batch relay 400 sin serial/sin sesión conectada, batch
+relay propaga a los jobs estáticos (confirmado leyendo la fila real de SQLite), batch relay propaga al
+aipwn encadenado (con el mismo mecanismo `link_job_run` que ya usaba el test de then_aipwn existente,
+no un mock inventado), y resume-aipwn preserva el relay de la corrida original. Además, 2 tests
+existentes (`spy_submit` en el test de source/serial del batch, y en el de resume-aipwn) tenían firmas
+desactualizadas que rompían con los kwargs nuevos -- corregidos. Suite completa: 445 pasan (los mismos
+6 fallos preexistentes sin relación).
