@@ -2728,3 +2728,20 @@ recientes en el ecosistema npm (paquetes populares comprometidos que exfiltran d
 npm) + `pnpm run build` produce un bundle **byte a byte idéntico** al que había generado npm
 (335166 bytes, diff sin salida) -- confirma que el swap de package manager no cambió el output.
 `pnpm run check` (`tsc --noEmit`) sigue en 0 errores. `node --check` sobre el bundle: sintaxis válida.
+
+## Fix: setup.sh — apkeep 0.10.0 daba 404 (2026-08-05)
+
+Reportado en vivo por el usuario corriendo `setup.sh` en la VM: `curl: (22) The requested URL
+returned error: 404` al descargar apkeep. Causa real: apkeep cortó un major (0.10.0 -> 1.0.0,
+2026-04-29) y el release viejo ya no existe en GitHub; de paso, el asset `x86_64-unknown-linux-musl`
+que usaba `setup.sh` tampoco existe más en el release nuevo (ahora es `-gnu`).
+
+Revisado el CHANGELOG real de apkeep (0.18.0 -> 1.0.0): son cambios aditivos (dex metadata, device
+properties propios, auth-token alternativo) + un fix de auth de Google Play -- nada que rompa las
+flags `-a`/`-d`/`OUTPATH` que usa `nutcracker_core/downloader.py`. Upgrade seguro, sin tocar código.
+
+Fix en `setup.sh`: en vez de fijar `APKEEP_VERSION` a mano (lo que causó esta rotura), resuelve el
+tag `latest` real vía la API de GitHub (`api.github.com/.../releases/latest`), con fallback a un tag
+fijo si la API no responde (rate limit/sin red). Asset corregido a `-gnu`. Verificado en vivo: la
+versión se resuelve a `1.0.0`, el binario descarga y corre (`apkeep --version`, `apkeep --help`
+confirma el mismo shape de CLI).
