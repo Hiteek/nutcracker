@@ -2821,3 +2821,39 @@ antes solo se podía con package id (descarga automática) o URL directa.
 correcto, extensión rechazada, firma de magic bytes rechazada -- sin dejar el archivo en disco --,
 traversal saneado, no pisa archivo existente, caracteres raros saneados, 401 sin sesión cuando auth
 está activado). Suite completa: 426 pasan (los mismos 6 fallos preexistentes sin relación).
+
+## Fix: nginx 413 al subir un APK real (2026-08-05)
+
+Reportado en vivo probando el feature de upload recién agregado: `413 Request Entity Too Large`.
+Causa: el default de nginx para `client_max_body_size` es apenas 1MB -- cualquier .apk real lo supera
+sin esfuerzo. No es un límite que pusimos nosotros a propósito, se me pasó al armar
+`nutcracker.nginx.conf` (el backend en sí no tiene límite propio, ver `POST /api/apks/upload`).
+
+Fix: agregado `client_max_body_size 500m;` al server block de `deploy/nutcracker.nginx.conf`. En la
+VM hace falta volver a copiar el archivo y recargar:
+```
+sudo cp deploy/nutcracker.nginx.conf /etc/nginx/conf.d/nutcracker.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+## Fix: mensaje de "no hay decompilador" asumía macOS (2026-08-05)
+
+Reportado en vivo con un job real corriendo en la VM: el log mostraba "brew install jadx" como única
+sugerencia -- Homebrew no existe en Linux, inútil en el VPS (o en cualquier WSL/Linux). Causa: el
+mensaje estaba hardcodeado a instrucciones de macOS sin chequear la plataforma real.
+
+Fix en `decompiler.py::install_instructions()`: ahora usa `platform.system()` para dar instrucciones
+reales según el SO (`brew install` en macOS, link al release de GitHub + apktool.org en Linux), y
+**siempre** menciona primero el toolbox de Docker (cross-platform, la opción correcta para un
+servidor/VPS sin querer instalar binarios en el host -- justo el caso de este VM). `DecompilerError`
+(en `decompile()`) dejó de tener su propio texto hardcodeado aparte y ahora reusa
+`install_instructions()`, para no tener dos mensajes que puedan desincronizarse.
+
+4 tests nuevos en `tests/test_decompiler.py` (mensaje por plataforma Darwin/Linux, toolbox siempre
+mencionado sin importar el SO, DecompilerError comparte el mismo texto). Suite completa: 430 pasan
+(los mismos 6 fallos preexistentes sin relación).
+
+Nota para el usuario: este mensaje es un síntoma, no la causa raíz -- en su VM, la causa real es que
+el toolbox de Docker (pasos dados un rato antes en la conversación: `toolbox.enabled: true` en
+config.yaml + usuario en el grupo `docker` + reiniciar el servicio) todavía no está terminado de
+activar.
