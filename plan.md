@@ -2769,3 +2769,55 @@ Dos fixes en el mismo bloque de `setup.sh`:
 Verificado en vivo (reproducido el mensaje cosmético primero para confirmar la causa, después
 confirmado que el fix lo elimina): misma versión resuelta (1.0.0), mismo binario descargado y
 funcional (`apkeep --version`), cero mensajes `curl:(23)` de ningún tipo.
+
+## Deploy real verificado en vivo en la VM (2026-08-05)
+
+Todo el checklist de `deploy/README.md` corrido de verdad contra la VM real del usuario (Azure,
+certs de otro proyecto en la misma máquina, PentestAI con su propio contenedor Docker en :443):
+
+- **Conflicto de puerto 443 real, no hipotético**: el sitio `default` de nginx (con un bloque SSL
+  agregado por un `certbot --nginx` de algún momento anterior, para el mismo hostname
+  `vm-sbx-1.eastus.cloudapp.azure.com`) competía por el 443 contra el contenedor `dashboard` de
+  PentestAI (publicado directo vía `docker-proxy`). Causaba que el paquete `nginx` de apt quedara a
+  medio instalar (`dpkg` con status roto) cada vez que cualquier otro `apt install` disparaba su
+  postinst. Resuelto con `sudo unlink /etc/nginx/sites-enabled/default` (reversible, no toca el
+  archivo real en `sites-available/`) + `sudo dpkg --configure -a` -- nginx arrancó limpio, sirviendo
+  SOLO lo que le pedimos (8765), sin tocar el 443 de PentestAI.
+- **Hallazgo que corrige una instrucción previa del README**: el `chown root:www-data` +
+  `chmod 440` que había indicado para los certs NO hacía falta -- nginx lee `ssl_certificate`/
+  `ssl_certificate_key` en su proceso MASTER, que corre como root (antes de que los workers bajen
+  privilegios a `www-data`), así que root puede leerlos sin importar su dueño/permisos actuales.
+  Confirmado en vivo: el usuario NO corrió ese paso y funcionó igual. De hecho dejar la key legible
+  SOLO por root es más restrictivo que lo que había sugerido -- se sacó ese paso del README.
+- Verificación de punta a punta contra la VM real: `curl -kI https://127.0.0.1:8765/` -> 302 a
+  `/login` (auth middleware funcionando); `curl https://127.0.0.1:8765/login` -> 200 con el HTML real
+  del login. `nutcracker-dashboard.service` activo con `auth=on` en el log de arranque.
+- Nota menor encontrada (no bloqueante): `/login` solo registra `GET` explícito, no `HEAD` --
+  `curl -I` (que manda HEAD) da 405. Un navegador real navega con GET, así que no afecta el flujo de
+  login; queda documentado por si en el futuro algo (monitoring/health-check) le pega con HEAD.
+
+## Feature: subir .apk desde el dashboard (2026-08-05)
+
+Pedido del usuario pensando en el despliegue en VPS: sin terminal en el servidor, no hay forma de
+dejar un .apk local en `downloads/` antes de encolar un job "analyze"/"dynamic" con target local --
+antes solo se podía con package id (descarga automática) o URL directa.
+
+- **Backend**: `POST /api/apks/upload` (nuevo, `api.py`) -- recibe `multipart/form-data`
+  (`UploadFile`), valida extensión `.apk` + firma de magic bytes real (`PK\x03\x04`/`PK\x05\x06`/
+  `PK\x07\x08`, ZIP/APK), sanea el nombre (`Path(filename).name` descarta cualquier componente de
+  directorio -- incluida una traversal tipo `../../etc/passwd.apk` -- + regex a caracteres seguros),
+  nunca pisa un archivo existente (numera `_1`, `_2`, ...), y guarda en `downloads/<nombre>.apk`
+  (mismo directorio/convención que ya usa `downloader.py`). Devuelve `path` en el formato exacto que
+  espera el campo `target` de `/api/queue` (`_is_local_apk()` en `queue/engine.py` solo chequea que el
+  path exista y termine en `.apk`).
+  Requirió agregar `python-multipart` a `plugins/dashboard/requirements.txt` (FastAPI no trae soporte
+  de multipart por sí solo).
+- **Frontend**: input de archivo + botón "Subir" arriba del form existente de "Cola de análisis" --
+  al subir, autocompleta el campo `target` con el path devuelto, listo para encolar.
+- Cubierto por auth: al vivir bajo `/api/`, el middleware de login ya lo protege sin cambios extra
+  (verificado con un test dedicado).
+
+**Verificación**: 7 tests nuevos en `tests/dashboard/test_api.py` (upload válido + path relativo
+correcto, extensión rechazada, firma de magic bytes rechazada -- sin dejar el archivo en disco --,
+traversal saneado, no pisa archivo existente, caracteres raros saneados, 401 sin sesión cuando auth
+está activado). Suite completa: 426 pasan (los mismos 6 fallos preexistentes sin relación).
