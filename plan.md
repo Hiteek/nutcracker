@@ -2697,3 +2697,34 @@ un monkeypatch a frida_agent.adb_transport que no existe como atributo).
 público interno pasó a puerto 8766 (Caddy sirve el 8765 público, ver arriba); la sección
 "Pendiente" ahora es solo multi-usuario real (una sola credencial compartida + API key del LLM
 compartida).
+
+## Migración de npm a pnpm en webusb/ (2026-08-05)
+
+Pedido del usuario: revisar si `setup.sh` usaba npm, con la hipótesis de que está "deprecado por
+supply chain" y hoy se usa pnpm. Aclaración hecha al usuario: npm no está deprecado formalmente, pero
+sí hay una razón de seguridad real y vigente para preferir pnpm -- bloquea por defecto los scripts
+`postinstall` de las dependencias, justo el vector que explotaron varios ataques de supply-chain
+recientes en el ecosistema npm (paquetes populares comprometidos que exfiltran datos/se propagan al
+`install`). Para un proyecto de seguridad como este, es una elección con fundamento, no solo moda.
+
+**Cambios, todos verificados en vivo (Node 24 + corepack, disponibles en este entorno):**
+- `webusb/package.json`: agregado `"packageManager": "pnpm@11.20.0+sha512..."` (vía `corepack use
+  pnpm@latest`) -- fija la versión exacta, instalación reproducible sin depender de qué pnpm tenga
+  cada máquina. Los scripts `check`/`build` tenían una indirección `npm run fetch-server` interna --
+  cambiada a invocar `fetch-scrcpy-server 3.3.1` directo, así quedan agnósticas de qué manager las
+  invoca.
+- Nuevo `webusb/pnpm-workspace.yaml` con `allowBuilds: { esbuild: true }` -- pnpm bloqueó el
+  postinstall de esbuild por default (`[ERR_PNPM_IGNORED_BUILDS]`); se aprobó explícitamente porque es
+  necesario (baja el binario nativo de la plataforma, lo usa vite) y su propósito es conocido. Ningún
+  otro paquete de las 125 dependencias necesita scripts de instalación -- quedan bloqueados por
+  default, que es justo la protección que motivó el cambio.
+- Borrado `webusb/package-lock.json` (lockfile de npm), generado `webusb/pnpm-lock.yaml`.
+- `setup.sh`: reemplazado todo el bloque de `npm install`/`npm run build` por `corepack enable` +
+  `pnpm install`/`pnpm run build`, con los mismos fallbacks (Node no encontrado, node/npm resolviendo
+  al .exe de Windows en WSL, corepack no encontrado).
+- `README.md` (raíz) y `webusb/README.md`: comandos actualizados a pnpm/corepack.
+
+**Verificación (no asumida, corrida de verdad):** `pnpm install` (125 paquetes, mismo conteo que con
+npm) + `pnpm run build` produce un bundle **byte a byte idéntico** al que había generado npm
+(335166 bytes, diff sin salida) -- confirma que el swap de package manager no cambió el output.
+`pnpm run check` (`tsc --noEmit`) sigue en 0 errores. `node --check` sobre el bundle: sintaxis válida.
