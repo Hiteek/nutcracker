@@ -2882,3 +2882,48 @@ correctamente.
 `decompile()` se invoca, no que corta antes), retrocompatibilidad (sin toolbox y sin binario local
 sigue fallando limpio, no "inventa" disponibilidad), y `_validate_all_dependencies` acepta el toolbox
 para la dependencia jadx. Suite completa: 433 pasan (los mismos 6 fallos preexistentes sin relación).
+
+## Auditoría completa del toolbox: 3 gaps más encontrados y arreglados (2026-08-05)
+
+Pregunta del usuario tras el fix de jadx: "¿cuándo el toolbox se activa se habilitan todas las
+tools?" -- auditoría real (no supuesta) de cada entrada de `toolbox.STATIC_TOOLS` contra el resto del
+código. Confirmado: **no**, cada módulo tiene que chequear `toolbox.is_enabled()` a mano, y varios no
+lo hacían -- mismo patrón de bug que el de jadx en `orchestrator.py::_do_decompile`.
+
+**Ya rutean bien** (sin cambios): `native_scanner.py` (nm/objdump/strings), `leak_scanner.py`
+(apkleaks/gitleaks), `decompiler.py` (jadx/apktool en el flujo principal de análisis estático, ya
+arreglado antes).
+
+**3 gaps reales encontrados y arreglados, todos verificados en vivo con tests:**
+
+1. **`analyzer.py::_run_apkid_detector`** -- `subprocess.run(["apkid", ...])` directo, sin chequear
+   toolbox. Fix: `APKAnalyzer.__init__` ahora acepta `config`, `_run_apkid_detector` rutea por
+   `toolbox.run("apkid", ...)` cuando está habilitado. Enchufado en el único call site
+   (`orchestrator.py`, `APKAnalyzer(..., config=_CFG)`). Rompió el test double `_FakeAnalyzer` en
+   `test_orchestrator.py` (no aceptaba el kwarg nuevo) -- corregido.
+2. **`deobfuscator.py::decompile_dumps`** -- `shutil.which("jadx")` directo. Este es el flujo de
+   deofuscación RUNTIME (DexGuard/FART/frida-dexdump), un camino de código separado del
+   `decompiler.decompile()` principal -- el bug de jadx original NO cubría este segundo lugar. Fix:
+   acepta `config`, rutea por `toolbox.run("jadx", ...)` por cada DEX volcado. El mensaje de error
+   cuando no hay decompilador ahora reusa `decompiler.install_instructions()` (mismo texto
+   centralizado y consciente de plataforma del fix anterior) en vez de un "brew install" hardcodeado
+   propio que tenía este archivo.
+3. **`pipeline.py::try_gadget_inject`** -- `shutil.which("apktool")` + `subprocess.run(["apktool", ...])`
+   directo, en el flujo de inyección de Frida Gadget (parcheo + repackaging del APK). Ya recibía
+   `cfg` como parámetro pero no lo usaba para esto. Fix: rutea ambas invocaciones (`apktool d` decompilar,
+   `apktool b` reempaquetar) por el toolbox. **Detalle no trivial encontrado**: `work_dir` se creaba con
+   `tempfile.mkdtemp()` a secas (bajo `/tmp` del sistema) -- invisible para el contenedor, que
+   `toolbox.run()` solo monta `Path.cwd()`. Corregido creando `work_dir` bajo `toolbox.scratch_dir()`
+   (mismo mecanismo que ya usa `leak_scanner.py`) cuando el toolbox está habilitado para apktool.
+
+**Fuera de alcance, discutido explícitamente con el usuario**: apksigner (`apk_tools.py`/`device.py`,
+usado para firmar el APK reparcheado) sigue sin toolbox -- es más discutible (firmar no es "analizar
+contenido de terceros" en el mismo sentido, y el apksigner de la imagen es best-effort per el propio
+Dockerfile.static). Se dejó fuera a pedido del usuario ("si arregla esos 3 gaps" -- los otros 3, no
+este).
+
+**Verificación**: 3 tests nuevos para apkid (inline, verificado con mocks) + `decompile_dumps` (inline)
++ nuevo `tests/test_pipeline_toolbox.py` (2 tests, mockeando pesado adb/descarga de gadget/firma para
+ejercitar la función real `try_gadget_inject` de punta a punta, confirmando las 2 invocaciones de
+apktool vía toolbox Y que `work_dir` queda bajo `scratch_dir()`). Suite completa: 435 pasan (los
+mismos 6 fallos preexistentes sin relación).
