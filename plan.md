@@ -2857,3 +2857,28 @@ Nota para el usuario: este mensaje es un síntoma, no la causa raíz -- en su VM
 el toolbox de Docker (pasos dados un rato antes en la conversación: `toolbox.enabled: true` en
 config.yaml + usuario en el grupo `docker` + reiniciar el servicio) todavía no está terminado de
 activar.
+
+## Fix real: el toolbox de Docker nunca se detectaba en el flujo de decompilación (2026-08-05)
+
+Reportado en vivo: usuario activó `toolbox.enabled: true` en su VM (grupo docker, imagen, todo según
+los pasos dados antes) pero el job seguía fallando con "No se encontró ningún decompilador". La causa
+NO era su config -- era un bug real en `orchestrator.py`, en DOS puntos separados que chequeaban
+disponibilidad de jadx sin pasarle el config cargado (`_CFG`):
+
+1. `_do_decompile()` (línea ~1187): `tool, _ = get_available_tool()` -- sin `config=_CFG`. Como
+   `toolbox.is_enabled(None)` siempre da False, este chequeo SIEMPRE reportaba "no hay decompilador"
+   sin importar `toolbox.enabled`, cortando antes de llegar a la línea de más abajo que sí pasaba
+   `config=_CFG` correctamente a `decompile()` -- esa línea nunca se alcanzaba.
+2. `_validate_all_dependencies()` (línea ~395): `if not _shutil.which("jadx")` a secas, ignorando el
+   toolbox por completo (ni siquiera pasaba por `decompiler.get_available_tool`/`_find_tool`).
+
+Fix: `_do_decompile()` ahora pasa `config=_CFG` a `get_available_tool()`; `_validate_all_dependencies()`
+usa `decompiler._find_tool("jadx", _CFG)` en vez de `shutil.which("jadx")` directo. Verificado en vivo
+(antes de escribir los tests formales): con `_CFG = {"toolbox": {"enabled": True}}` y
+`shutil.which` mockeado a `None` (nada instalado local), ambos puntos ahora devuelven `"toolbox"`
+correctamente.
+
+3 tests nuevos en `tests/test_orchestrator.py`: toolbox detectado sin jadx local (confirma que
+`decompile()` se invoca, no que corta antes), retrocompatibilidad (sin toolbox y sin binario local
+sigue fallando limpio, no "inventa" disponibilidad), y `_validate_all_dependencies` acepta el toolbox
+para la dependencia jadx. Suite completa: 433 pasan (los mismos 6 fallos preexistentes sin relación).
