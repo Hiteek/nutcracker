@@ -2966,3 +2966,36 @@ preexistentes sin relación).
 automáticamente en `db.connect()`, no hace falta ningún paso manual). Reencolar el job de
 `sh.nutcracker.nutbank` con "vía relay" + el session id debería funcionar ahora incluso si el dashboard
 se reinicia entre que se encola y que corre.
+
+## Segundo bug real (mío): el shim de adb nunca mandaba el token interno (2026-08-05)
+
+Tras el fix de persistencia de relay_session_id, el usuario reencoló el mismo job aipwn (relay_session_id
+confirmado guardado correctamente esta vez, `id=10` en la DB) y **siguió fallando idéntico**. Esto
+descartó la persistencia como única causa y llevó a auditar el resto de la cadena.
+
+**Causa real**: al agregar el login (sesión anterior de este mismo día), `AuthMiddleware` pasó a proteger
+`/api/*` completo -- pero `toolbox/relay_adb_shim/adb` (el shim que traduce cada llamada `adb` de un job
+relay-backed en un RPC contra el dashboard) nunca se actualizó para mandar el token interno
+(`NUTCRACKER_DASHBOARD_TOKEN`/header `X-Nutcracker-Token`) que sí usa `frida_agent.py::_check_operator_chat`
+desde ese mismo trabajo de auth. Con auth activado, CADA rpc del shim (shell/install/pull/screencap/logcat)
+recibía 401 en silencio -- `check_app_installed()` (aipwn.py) solo mira `r.stdout` (vacío cuando el shim
+falla y escribe a stderr), así que interpretaba "app no instalada" pese a que la sesión de relay estaba
+perfectamente conectada (`attached: true` confirmado por separado). Auditado el resto del codebase: es el
+único otro consumidor de `NUTCRACKER_DASHBOARD_URL` además de `frida_agent.py` (ya correcto) -- no hay más
+gaps de este patrón.
+
+**Fix**: `_rpc_post()` del shim ahora lee `NUTCRACKER_DASHBOARD_TOKEN` del entorno (inyectado por
+`engine.py` cuando el dashboard tiene auth activado, mismo mecanismo ya existente) y lo manda como header
+`X-Nutcracker-Token` -- sin la env var (dashboard sin auth), no manda nada, retrocompatible.
+
+**Verificación, la más completa de esta sesión para un fix puntual**: reproducido el bug real contra un
+servidor uvicorn REAL (no mock) con auth activado + el shim como subproceso REAL (no importado) -- sin
+token: `401 authentication required` (reproduce el síntoma exacto); con el token: pasa la auth limpio,
+falla recién por sesión de relay inexistente (esperado, no había una real armada para la prueba). 2 tests
+nuevos en `tests/test_relay_adb_shim.py` (header presente con la env var seteada, ausente sin ella --
+usando el fake HTTP server ya existente en el archivo, extendido para capturar headers). Suite completa:
+440 pasan (los mismos 6 fallos preexistentes sin relación).
+
+**Para el usuario**: en la VM, `git pull` + `sudo systemctl restart nutcracker-dashboard`. Con los dos
+fixes de esta sesión (persistencia + token del shim), reencolar el job de `sh.nutcracker.nutbank` vía
+relay debería funcionar de punta a punta ahora.
