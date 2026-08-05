@@ -2632,4 +2632,68 @@ extra):
 
 Pendiente explícito documentado en el propio README: con esto el dashboard queda en HTTPS pero sigue
 **sin autenticación** -- cualquiera con la URL puede operarlo. Es el siguiente bloqueador real, no
-cubierto por este cambio.
+cubierto por este cambio. (Resuelto después, ver la sección de login más abajo.)
+
+## Deploy actualizado: VM real en la nube, cert ya existente, nginx en vez de Caddy (2026-08-05)
+
+El usuario ya tiene la VM concreta: acceso solo por SSH, con un certificado TLS YA EMITIDO como
+archivo en la VM (cubre el hostname público que el proveedor de nube le asignó). Cambios sobre el
+setup anterior:
+
+- **Sin Let's Encrypt/DuckDNS**: el cert ya existe, no hace falta que nada lo emita -- se cargan los
+  archivos directo. Sin ACME, tampoco hace falta el puerto 80 abierto (ni en el security group de la
+  nube ni en `ufw`).
+- **Proxy: nginx en vez de Caddy** (decisión del usuario, tras preguntarle -- también se ofreció
+  "uvicorn con TLS nativo, sin proxy" como opción más minimalista, pero eligió nginx). `deploy/Caddyfile`
+  se borró; nuevo `deploy/nutcracker.nginx.conf` -- a diferencia de Caddy, nginx NO maneja WebSocket
+  solo: hace falta el bloque `map $http_upgrade $connection_upgrade` + `proxy_set_header
+  Upgrade/Connection` a mano, si no el handshake de `/ws/jobs`, `/ws/chat`, `/ws/relay` falla. También
+  se subió `proxy_read_timeout`/`proxy_send_timeout` a 3600s -- el default de nginx (60s) cortaría
+  WebSocket idle a mitad de un job largo o una sesión de relay.
+- **Higiene open source**: los certs de la VM del usuario en la práctica viven dentro del directorio
+  de otro proyecto suyo (no-público) que resulta compartir la máquina -- el usuario marcó explícito que
+  no quiere ninguna ruta específica de ese proyecto en el repo público de nutcracker. `deploy/` quedó
+  genérico: `nutcracker.nginx.conf` usa `/etc/nutcracker/tls/cert.pem`/`key.pem` como convención de
+  ejemplo (paso 0 nuevo del README, "dónde poner el certificado"), y el README documenta el riesgo de
+  acoplamiento en términos genéricos ("si tu cert vive en el directorio de otra app...") sin nombrar
+  nada específico del usuario. Mismo criterio aplicado acá arriba (sin el hostname real ni el nombre
+  del otro proyecto).
+- Resto sin cambios: puerto público 8765, dashboard interno 127.0.0.1:8766, login vía
+  `dashboard-hash-password` (paso 3.5 del README).
+
+## Login / autenticación del dashboard (2026-08-05)
+
+Pedido del usuario antes de desplegar en VPS: "implementa un login a la página y que
+todo el flujo sea autenticado". Es el bloqueador #2 que veníamos difiriendo (después del
+HTTPS).
+
+**Diseño (sin dependencias externas — itsdangerous NO está instalado):**
+- `plugins/dashboard/auth.py` (nuevo): hashing pbkdf2-sha256 (stdlib), tokens de sesión
+  firmados con HMAC-SHA256 (stateless: payload=usuario:expiración + firma; no hay store de
+  sesión en el server, sobrevive reinicios si el `secret_key` es fijo), y un middleware ASGI
+  puro que protege HTTP + WebSocket. Cookie HttpOnly/SameSite=Lax/Secure.
+- Credenciales en `config.yaml` (`dashboard.auth`): username + password_hash (nunca texto
+  plano) + secret_key + session_hours. Se activa solo con `enabled: true` -- sin config, el
+  dashboard queda abierto (uso local/dev, retrocompat: los 97 tests de dashboard existentes
+  pasan sin tocar).
+- **Token interno (machine credential)**: generado al arrancar, inyectado al subproceso aipwn
+  por env (`NUTCRACKER_DASHBOARD_TOKEN`), que lo manda en el header `X-Nutcracker-Token` al
+  pollear el mailbox de chat. NECESARIO porque detrás de Caddy toda request llega desde
+  127.0.0.1 -- no se puede eximir al subproceso por IP de origen (un bypass de localhost
+  eximiría también a todo el tráfico proxeado, anulando el login).
+- Middleware: /api/* no auth → 401 JSON; SPA no auth → 302 /login; WS no auth → close 1008.
+- Frontend: pantalla `static/login.html` self-contained; `j()` redirige a /login en 401; los
+  WebSocket redirigen en close 1008; botón "Salir" (logout).
+- CLI nuevo `dashboard-hash-password` para generar el hash + bloque YAML listo para pegar.
+
+**Verificación:** 24 tests nuevos en `tests/dashboard/test_auth.py` (hashing, tokens firmados
+con casos de manipulación/expiración, AuthConfig, y flujo end-to-end vía TestClient: 401 sin
+sesión, redirect del SPA, login→cookie→acceso→logout, bypass por token interno, rechazo de WS
+no autenticado, WS aceptado con cookie, retrocompat sin auth). Suite completa: 419 pasan
+(los mismos 6 fallos preexistentes de test_aipwn_adb_transport_reconnect.py, sin relación --
+un monkeypatch a frida_agent.adb_transport que no existe como atributo).
+
+**deploy/**: README actualizado con el paso 3.5 (activar login antes de exponer); config.yaml
+público interno pasó a puerto 8766 (Caddy sirve el 8765 público, ver arriba); la sección
+"Pendiente" ahora es solo multi-usuario real (una sola credencial compartida + API key del LLM
+compartida).
