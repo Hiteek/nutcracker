@@ -3318,3 +3318,145 @@ Suite completa: 503 pasan (mismos 6 fallos preexistentes sin relación, ninguno 
 Con esto, el catálogo completo de tools dinámicas del co-piloto (14: las 9 reusadas de
 Frida + las 5 de UI/pantalla propias) funciona igual en modo relay que en modo serial --
 sin limitaciones conocidas pendientes para las tools existentes.
+
+### Fix menor: el agente no sabía describir su propio mecanismo (adb vía relay)
+
+Verificado en vivo (sesión real, `com.joinnus.joinnus_organizer` conectado por relay):
+`take_screenshot` funcionó de punta a punta -- capturó, el LLM interpretó correctamente la
+pantalla (detalles de red WiFi, no la app objetivo) y propuso un siguiente paso sensato.
+Confirma en producción el fix de relay de las secciones anteriores.
+
+Pero al preguntársele "¿tenés adb integrado vía relay?", el agente contestó que no tenía
+nada de adb -- impreciso: `ui_tap`/`ui_input_text`/`ui_press_key`/`ui_swipe` SON, por debajo,
+exactamente un `adb shell input ...` (tap/text/swipe/keyevent), y `take_screenshot` es
+`adb exec-out screencap`, enrutados de forma transparente por serial o por el túnel relay
+según la sesión. El system prompt (`_QUERY_SYSTEM_PROMPT` en `query_agent.py`) nunca le
+explicó ESE mecanismo interno, solo los nombres de las tools -- así que no podía responder
+la pregunta meta con precisión, aunque el comportamiento funcional seguía siendo correcto.
+
+Fix: párrafo nuevo en el system prompt explicando el mecanismo real detrás de cada tool
+dinámica de UI/pantalla, y aclarando qué SÍ queda fuera de alcance (shell arbitraria --
+`pm list packages`, `cat`, `logcat` on-demand, etc. -- solo `run_frida_script` da ejecución
+de código arbitraria, vía JS en el proceso, no una shell del device).
+
+**Verificado en vivo** (LLM real, modo estático): "¿Tenés adb integrado vía relay? ¿Qué
+podés hacer exactamente?" → respuesta correcta y completa, listando el comando `adb shell`
+real detrás de cada tool y las limitaciones genuinas.
+
+Sin tests nuevos (cambio de texto de prompt, no de lógica) -- validado por inspección del
+`.format()` (no rompe con las llaves nuevas) y la corrida completa de
+`test_aipwn_query_agent.py` (8/8 verdes).
+
+### Feature: get_logcat -- exponer DeviceIO.logcat() directo al LLM
+
+El usuario probó de nuevo en vivo ("si tienes acceso adb intenta usar adb logcat") y el
+agente contestó, correctamente según el catálogo de ese momento, que no tenía logcat
+on-demand -- literalmente repitiendo la frase que el propio system prompt le había puesto
+("no `logcat` on demand") en el fix anterior. No era un malentendido del LLM: la plomería
+de `DeviceIO.logcat()` ya existía (usada internamente por `run_frida_script` para
+correlacionar SSL errors/crashes), pero nunca se había expuesto como tool propia que el
+operador pudiera pedir directo, sin inventar un script Frida.
+
+**Fix**: nueva tool `get_logcat(duration_seconds=10, filter_spec="")` en `query_tools.py`:
+- `tool_get_logcat`: limpia el buffer primero (`device.shell("logcat -c")`) para que la
+  ventana solo muestre eventos NUEVOS durante la captura, después `device.logcat(...)` --
+  reusa la abstracción `DeviceIO` tal cual (serial vía Popen+timeout, relay vía el RPC
+  dedicado `"logcat"`), sin código nuevo de transporte. `duration_seconds` clamp a [1, 60].
+- Agregada a `_RUNTIME_DEVICE_TOOL_NAMES` y `_OWN_DEVICE_TOOL_NAMES` (funciona en ambos
+  modos por diseño, como `take_screenshot`/`ui_*`) y al dispatcher.
+- System prompt (`query_agent.py`): agregada a la lista de tools dinámicas; el párrafo
+  sobre "qué NO puede hacer" se corrigió -- ya no dice "no logcat on demand" (ahora es
+  falso), solo shell arbitraria genérica (`pm list packages`, `cat`, `ps`).
+
+**Tests nuevos**: sin device → error limpio; serial → confirma que `logcat -c` corre
+primero vía `shell()` y la captura después vía `Popen`; relay → confirma que usa el RPC
+dedicado `"logcat"` (no el `"shell"` genérico) con el `filter_spec` parseado a args. 3 tests
+nuevos.
+
+**Verificado en vivo** (LLM real, modo estático): misma pregunta que motivó el fix
+("si tienes acceso adb intenta usar adb logcat") → ahora responde correctamente listando
+`get_logcat` como equivalente a `adb logcat` junto con el resto de las tools.
+
+Suite completa: 506 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+### Bug de plataforma (no de esta feature): `Module.findExportByName`/`getExportByName` \
+eliminados en Frida 17 -- afecta a TODO el sistema, no solo al co-piloto
+
+Sesión real contra `com.joinnus.joinnus_organizer` (device rooteado, frida-server presente,
+confirmado por el usuario): `run_frida_script` con `spawn_gated=true` SÍ llegó a conectar,
+spawnear y cargar el script (no era un problema de infraestructura/relay) -- pero el script
+que el LLM escribió tiró `"TypeError: not a function"` justo en la línea de
+`Module.findExportByName('libc.so', 'connect')`.
+
+**Confirmado en vivo contra Frida real** (no un mock -- `frida.attach()` a un proceso local,
+Frida 17.16.4, la misma versión que usa este repo): `Module.findExportByName(lib, sym)` y
+`Module.getExportByName(lib, sym)` (la forma estática de dos argumentos) fueron **eliminadas
+por completo** de la API de Frida 17 -- ni siquiera devuelven `null` como antes, tiran
+`TypeError: not a function` de inmediato. Es exactamente el patrón más documentado en
+tutoriales/Stack Overflow viejos de Frida, así que cualquier LLM lo va a escribir por
+default salvo que se le diga explícitamente lo contrario.
+
+**Alcance real, más grande que el co-piloto**: esto no es un bug de `query_agent.py` --
+afecta a:
+1. **`frida_agent_tools.py::tool_resolve_native_symbol`** -- una tool INTEGRADA del propio
+   proyecto (no generada por el LLM) usaba el patrón roto en sus 4 ocurrencias. Afecta tanto
+   al agente autónomo (`FridaAgent`, CLI/jobs) como al co-piloto -- ambos la comparten.
+2. **Cualquier script Frida que el LLM escriba** en `run_frida_script`, en cualquiera de los
+   dos agentes (autónomo o co-piloto) -- ninguno de los dos system prompts mencionaba esta
+   API rota antes de este fix.
+
+**Fix**:
+- `tool_resolve_native_symbol` -- reemplazado el patrón roto por un helper JS
+  `findExport(libName, symbolName)` que usa `Module.findGlobalExportByName(sym)` (búsqueda
+  global) o `Process.findModuleByName(lib).findExportByName(sym)` (una lib puntual) --
+  mismos verificados en vivo contra Frida real: devuelven `null` si no se encuentra, igual
+  que la API vieja, nunca lanzan.
+- `frida_agent.py::_SYSTEM_PROMPT` y `query_agent.py::_QUERY_SYSTEM_PROMPT` -- regla nueva
+  explicando el reemplazo, puesta al lado de la regla preexistente de diagnóstico de
+  "TypeError: not a function" en `Interceptor.attach` (para no confundir las dos causas
+  distintas del mismo mensaje de error).
+
+**Tests nuevos**: `test_aipwn_resolve_native_symbol_frida17.py` -- (1) red de seguridad
+estática (`Module.findExportByName(`/`Module.getExportByName(` no debe aparecer más en el
+código fuente de la tool), y (2) el script JS reemplazado corriendo de verdad contra un
+proceso real vía `frida.attach()` (no mockeado), confirmando que resuelve un símbolo real
+(`malloc`) sin tirar -- exactamente la misma técnica con la que se reprodujo el bug original.
+2 tests nuevos, con skip gracioso si `ptrace` no está disponible en el sandbox de CI.
+
+Suite completa: 508 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+### Fix: mismatch de versión cliente/frida-server -- causa raíz real de la sesión
+
+El usuario mandó una captura de `ls -la /data/local/tmp/` del device: tiene guardadas varias
+versiones de `frida-server` (16.2.2, 16.2.3, 17.15.4, **17.16.4**, 17.5.0), y `17.16.4`
+coincide EXACTO con el cliente Frida del host (`frida --version` → 17.16.4, confirmado antes
+en esta sesión). Pero `setup_frida_server` (frida_capture.py) tenía **hardcodeado**
+`/data/local/tmp/frida-server` -- el binario SIN sufijo de versión, de fecha 2026-07-24,
+casi seguro una versión distinta a la 17.16.4 (agregada después, 2026-08-07). Un mismatch
+cliente/server es la causa más común de "conecta, banner de Frida, pero nunca engancha con
+el proceso" -- exactamente el patrón visto en toda la sesión.
+
+**Fix**: nueva `_resolve_frida_server_path(adb_args, shell_fn=None)` en `frida_capture.py`:
+lee la versión del cliente (`frida.__version__`, ya una dependencia) y busca en el device
+`ls /data/local/tmp/frida-server-<versión>*` (glob, no nombre exacto -- la convención de
+sufijo de arquitectura no es consistente entre binarios, algunos tienen `-android-arm64`,
+otros no). Si encuentra un match, `setup_frida_server` lanza ESE binario en vez del genérico;
+si no, cae al de siempre (`/data/local/tmp/frida-server`, cero cambio de comportamiento).
+Funciona tanto con `shell_fn` (relay) como con el `adb` local (serial/CLI/jobs) -- mismo
+patrón dual que el resto de esta sesión.
+
+**Bug menor encontrado de paso**: `killall frida-server` solo mata el proceso si su *nombre
+exacto* es `frida-server` -- si había quedado corriendo como `frida-server-17.16.4` de un
+intento previo (justo el escenario que este fix hace más común, al lanzar binarios
+versionados), `killall` no lo alcanzaba y el reinicio podía chocar de puerto. Agregado
+`pkill -f frida-server` como respaldo (matchea por substring en la línea de comando
+completa) en las dos ramas (`shell_fn` y `adb` local).
+
+**Tests nuevos**: `_resolve_frida_server_path` con match (relay y serial), sin match (cae al
+default), y con el canal de shell tirando una excepción (nunca debe propagar, siempre cae al
+default); más un test de que el `killall`+`pkill -f` de respaldo está presente en el comando
+de reinicio. Actualizado también `test_setup_frida_server_without_shell_fn_keeps_old_behavior`
+para reflejar la llamada nueva de resolución (antes de este fix, 3 llamadas a `subprocess.run`
+-- killall/start/force-stop; ahora 4, con el `ls` de resolución primero). 5 tests nuevos.
+
+Suite completa: 513 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
