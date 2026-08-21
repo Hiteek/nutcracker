@@ -3460,3 +3460,77 @@ para reflejar la llamada nueva de resolución (antes de este fix, 3 llamadas a `
 -- killall/start/force-stop; ahora 4, con el `ls` de resolución primero). 5 tests nuevos.
 
 Suite completa: 513 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+## Feature: suite de interceptación / MITM (pedido explícito, 2026-08-21)
+
+Pregunta del usuario: "¿el sistema tiene la capacidad de interceptar peticiones o hacer MITM
+mediante relay con inyección de scripts de Frida, o falta algo por implementar?". Respuesta:
+faltaba. Lo único que había (`sniff_network_calls`) es pasivo, solo Java (no ve nada en
+Flutter/React Native -- exactamente el caso `com.joinnus.joinnus_organizer` que motivó las
+sesiones anteriores) y sin body/headers. Pedido del usuario: "quiero que el agente tenga la
+capacidad de hacer todo eso dependiendo lo que necesite" -- se armó la suite completa en tres
+capas, todas construidas sobre la plomería que quedó relay-safe en las sesiones previas.
+
+**1. `capture_traffic(duration_seconds, filter)`** (`frida_agent_tools.py`) -- captura pasiva
+en dos capas a la vez: Java/OkHttp (método, URL, headers y body COMPLETOS via `peekBody` --
+no consume el stream real) + nativa (`SSL_write`/`SSL_read` sobre libssl/libboringssl/
+libconscrypt/**libflutter**/libcrypto, reenganchado en `dlopen`/`android_dlopen_ext` porque
+libflutter carga tarde). Usa `Module.findGlobalExportByName`/`Process.findModuleByName().
+findExportByName` -- la API de Frida 17 ya estandarizada, nunca la forma estática eliminada.
+Vía `_run_frida_query` (sin slot, ya relay-safe). Resuelve el caso Flutter que
+`sniff_network_calls` no podía ver.
+
+**2. `intercept_and_modify(rules, duration_seconds)`** (`frida_agent_tools.py`) -- MITM activo:
+reglas `{match, action: log|block|replace_request_body|replace_response_body|set_header,
+value}` sobre las mismas dos capas. Consume un slot de Frida (vía `ctx.on_frida_run`) --
+`frida_agent.py::FridaAgent.run()` antes solo chequeaba el nombre literal `"run_frida_script"`
+en 3 lugares para el gate de `max_frida_runs`; se agregó `_FRIDA_SLOT_TOOL_NAMES = {"run_
+frida_script", "intercept_and_modify"}` y se reemplazaron los 3 chequeos por `in`, para que
+el agente autónomo tampoco pueda saltarse el presupuesto con la tool nueva. Limitación
+documentada (en la description de la tool, para que el LLM se lo diga al operador): en el
+nivel nativo, reemplazar una *response* en `SSL_read` solo puede reescribir hasta la longitud
+ORIGINAL del buffer del caller -- no se puede crecer una respuesta ya cifrada; para
+reemplazos más largos, usar el nivel Java/OkHttp (`ResponseBody` completamente nuevo, sin
+límite).
+
+**3. `setup_mitm_proxy`/`teardown_mitm_proxy`** (`query_tools.py`, propias del co-piloto) --
+pipeline clásico de proxy (Burp/mitmproxy): `settings put/delete global http_proxy` (vía
+`DeviceIO.shell`, serial y relay transparente), instalación de la CA del operador en el
+trust store del sistema (device rooteado, confirmado por el usuario en la sesión anterior --
+calcula el hash con `openssl x509 -subject_hash_old`, sube el cert en **base64 vía shell**
+en vez de necesitar un RPC de "push" que hoy no existe en el relay, remonta `/system` rw con
+`su -c`), y corre el bypass heurístico de pinning existente (`generate_bypass_script`, reuso
+directo de `tool_get_heuristic_bypass_script`) para que el pinning no rompa el TLS proxeado.
+`proxy`/`ca_cert_path` caen a `config.yaml` (`aipwn.mitm.proxy`/`aipwn.mitm.ca_cert_path`) si
+no vienen como argumento. **Caveat documentado en la tool y el prompt**: el device tiene que
+alcanzar el proxy por su propia red -- el relay solo tunelea `frida`+`adb`
+(`relay.py::TUNNELS`), no TCP arbitrario, así que esto NO pasa por el relay.
+
+**Wiring**: las 5 tools nuevas se agregaron a `_RUNTIME_DEVICE_TOOL_NAMES` (preflight) y a
+`_RELAY_READY_REUSED_TOOL_NAMES`/`_OWN_DEVICE_TOOL_NAMES` (ya listas en relay, sin
+excepciones -- todo el catálogo dinámico sigue funcionando igual en ambos modos). System
+prompt del co-piloto (`query_agent.py`) actualizado con guía de decisión explícita: cuándo
+usar `sniff_network_calls` (chequeo rápido Java) vs `capture_traffic` (default para Flutter/
+RN o cuando se necesita body completo) vs `intercept_and_modify` (cuando hay que tamperar,
+no solo observar) vs `setup_mitm_proxy` (cuando el operador quiere ver/editar TODO con una
+UI de proxy real).
+
+**Tests nuevos**: `test_aipwn_traffic_interception.py` (10 tests -- regresión estática de la
+API de Frida 17 en ambos scripts nuevos, parseo de eventos Java+nativos de `capture_traffic`,
+`intercept_and_modify` embebe las reglas y propaga `frida_iteration`, la limitación de
+longitud nativa está documentada en la description que ve el LLM, wiring de `dispatch_tool` +
+`_FRIDA_SLOT_TOOL_NAMES` gatea la tool nueva en el agente autónomo) y
+`test_aipwn_mitm_proxy.py` (11 tests -- proxy set/delete, instalación de CA con hash real de
+openssl mockeado, error claro si falta el cert o el proxy, bypass de pinning con
+`frida_iteration` propagado, fallback a `config.yaml` -- mockeando `load_config` directo
+porque resolvió ser una ruta ABSOLUTA fija del paquete, no relativa al cwd del test --,
+wiring de `dispatch_query_tool` y preflight de relay para las 4 tools nuevas). 21 tests
+nuevos.
+
+**Verificado en vivo** (LLM real, modo estático): "¿Podés interceptar y modificar el tráfico
+de esta app, o solo leerlo? ¿Y armar un proxy MITM con Burp?" → el agente explica
+correctamente las tres modalidades (pasivo dos capas, activo con la limitación de longitud,
+proxy clásico con el caveat de red) sin haber tenido que llamar ninguna tool (pregunta
+conceptual, respondida desde el system prompt).
+
+Suite completa: 534 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
