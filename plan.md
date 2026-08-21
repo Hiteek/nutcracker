@@ -3029,3 +3029,52 @@ no un mock inventado), y resume-aipwn preserva el relay de la corrida original. 
 existentes (`spy_submit` en el test de source/serial del batch, y en el de resume-aipwn) tenían firmas
 desactualizadas que rompían con los kwargs nuevos -- corregidos. Suite completa: 445 pasan (los mismos
 6 fallos preexistentes sin relación).
+
+## Feature: fallbacks por línea en el batchero (2026-08-05)
+
+Pedido del usuario: cada línea del .txt del batch se resuelve sola según su formato -- ``*.apk`` busca
+en ``downloads/``, un package id intenta primero el dispositivo conectado y si no está instalado ahí
+(o no hay dispositivo) cae solo a la store, sin que el operador tenga que saber de antemano qué apps
+ya están instaladas en el device de pruebas.
+
+**Nuevo source `"device-or-store"`** (`downloader.py::download_apk_from_config`): igual que `"device"`
+existente, pero atrapa `APKDownloadError` del pull y en vez de propagarlo cae al auto-selección normal
+(google-play si hay credenciales, si no apk-pure) -- mismo mecanismo, un solo `try/except` nuevo.
+Registrado en el `click.Choice` de `cli/scan.py --source` (si no, el subproceso `scan --source
+device-or-store` fallaría con "invalid choice") y en `orchestrator.py::build_job_cmd` (pasa `--serial`
+también con este nuevo valor, igual que ya hacía con `"device"`).
+
+**Clasificación por línea** (`plugins/dashboard/api.py::classify_batch_target`, nueva función pura,
+testeable sin FastAPI/DB):
+- Línea `http(s)://...` → sin cambios, comportamiento previo intacto.
+- Línea termina en `.apk` → busca `downloads/<basename>` (solo el basename cuenta -- protegido contra
+  path traversal tipo `../../etc/evil.apk`). Si existe, el target pasa a ser esa ruta local. Si NO
+  existe, la línea se **salta** (no tira abajo el resto del batch) y se reporta en la respuesta.
+- Cualquier otra cosa → package id, `source="device-or-store"` **salvo** que el operador haya forzado
+  una fuente explícita en el dropdown del batch (el nuevo fallback es el default, no pisa una elección
+  explícita).
+
+`queue_batch()` ahora devuelve `{"queued": N, "skipped": [{"target", "reason"}, ...]}` en vez de solo
+`{"queued": N}` -- el frontend muestra un alert con el detalle si algo se saltó. Dropdown del batch
+renombrado ("fuente: auto por línea (default)" / "fuente: forzar device (sin fallback)") con tooltip
+explicando el comportamiento nuevo.
+
+**Verificación**: 3 tests nuevos en `test_downloader_device.py` (usa device cuando responde OK sin
+tocar la store, cae a APKPure cuando el device falla, cae a Google Play en vez de APKPure si hay
+credenciales configuradas -- mismo criterio de auto-selección que `source=None`). 7 tests nuevos en
+`test_api.py` (`classify_batch_target` unitario: .apk encontrado/no encontrado/con path traversal,
+package id con y sin override explícito, URL sin cambios; más un test end-to-end con las tres formas
+de línea mezcladas en el mismo batch, confirmando que una línea inválida no bloquea al resto).
+
+**Dos bugs de aislamiento de tests encontrados de paso** (no de producción): `test_resume_aipwn_
+preserves_relay_session` (escrito en esta misma sesión, unas horas antes) tenía una carrera real
+contra el hilo de fondo de `resume-aipwn` -- leía `engine._pending` en vez de la fila de SQLite,
+así que si el drain de fondo ya había vaciado `_pending` el assert fallaba en carrera. Corregido
+leyendo `repository.get_job()` (fuente de verdad estable) en vez del estado en memoria.
+`test_queue_batch_ignores_blank_lines_and_comments` (preexistente) nunca mockeaba `subprocess.run`
+-- dependía en silencio de que un scan real contra red real (apkpure.com, package inventado)
+terminara dentro del timeout de 5s del test; con el nuevo default `device-or-store` agregando un paso
+extra (intento de adb antes de la store), ese margen implícito dejó de alcanzar en algunas corridas.
+Corregido mockeando `subprocess.run` igual que sus tests vecinos -- ya no depende de red ni de timing.
+
+Suite completa: 455 pasan (los mismos 6 fallos preexistentes sin relación, ninguno nuevo).
