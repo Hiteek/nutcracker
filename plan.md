@@ -3078,3 +3078,98 @@ extra (intento de adb antes de la store), ese margen implícito dejó de alcanza
 Corregido mockeando `subprocess.run` igual que sus tests vecinos -- ya no depende de red ni de timing.
 
 Suite completa: 455 pasan (los mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+## Feature: co-piloto de pentest interactivo ("Pentest asistido", 2026-08-21)
+
+Pedido del usuario: un chat de pentest asistido -- responder preguntas sobre el análisis
+estático y los resultados de aipwn, y también poder pedirle en lenguaje natural que use
+Frida/ADB en vivo (ver la pantalla del celular, ingresar usuario/contraseña, etc.),
+dándole feedback interactivo. A diferencia del chat existente (`/ws/chat`, inyección en un
+job `aipwn` **autónomo** ya corriendo), esto tiene que funcionar **sin ningún job
+corriendo** y ser una conversación de verdad, no un canal unidireccional.
+
+**Diseño**: nueva pestaña "Pentest asistido" en el dashboard, con su propio WebSocket
+(`/ws/query/{package}`), separada del chat en vivo existente -- decisión del usuario para
+no mezclar dos conceptos con comportamiento distinto en el mismo lugar.
+
+**`plugins/aipwn/query_agent.py`** (nuevo) -- `QueryAgent`: loop ReAct conversacional
+(reusa `LLMClient`/`ToolContext`/`_tool_result_message`/`_screenshot_image_message` de
+`frida_agent.py` tal cual, sin duplicarlos). A diferencia de `FridaAgent` (bypass autónomo
+con presupuesto fijo de iteraciones/runs), este agente responde un turno por mensaje del
+operador y **no termina solo** -- cada `ask()` corre hasta que el LLM responde sin más
+tool_calls y ahí espera el próximo mensaje humano. Sin límite estricto de Frida runs (lo
+maneja el operador).
+
+**`plugins/aipwn/query_tools.py`** (nuevo) -- catálogo de tools del co-piloto, tres grupos:
+- Reusadas de `frida_agent_tools.py` sin modificar (17 tools: 8 estáticas de disco +
+  9 de runtime/introspección/acción, ver `_REUSED_TOOL_NAMES`) -- delega a su
+  `dispatch_tool` existente, no reimplementa nada.
+- Nuevas de consulta sobre reportes ya generados (funcionan sin device ni job corriendo):
+  `list_findings`/`get_finding_detail` (tabla `findings` del store + enriquecido con
+  `reports/<pkg>/vuln.json` para description/recommendation, que no vive en la DB),
+  `list_components` (reusa `manifest_analyzer.analyze_decompiled_dir` tal cual),
+  `list_secrets` (filtra por keyword + cruza con `decompiled/vuln_<pkg>_review.json`
+  de aireview y `exploit_report_<pkg>.json` de aipwn para el estado de validez real),
+  `get_exploit_results` (lee el exploit report de aipwn directo).
+- Nuevas de pantalla/UI vía `DeviceIO` (nueva clase, abstrae serial USB directo vs relay
+  WebUSB -- ver más abajo): `take_screenshot` (versión propia, NO la de
+  `frida_agent_tools.py` -- esa hace `adb` directo sin soportar relay; reusa la misma
+  lógica de resize/JPEG/detección de pantalla negra, y el JSON que devuelve es compatible
+  con `_screenshot_image_message` para la inyección multimodal), `ui_tap`, `ui_input_text`,
+  `ui_swipe`, `ui_press_key` (todas `input ...` vía `DeviceIO.shell`).
+
+Excluidas a propósito: `patch_native_lib`/`relaunch_with_gadget` (reinstalan/parchean el
+APK -- demasiado destructivo para un co-piloto interactivo) y `report_success`/
+`report_failure` (terminación autónoma, no aplica a un agente conversacional).
+
+**`DeviceIO`** (en `query_tools.py`): `screencap()`/`shell(cmd)` con dos backends --
+serial (`adb -s <serial> ...` directo) o relay (RPCs `screencap`/`shell` ya existentes de
+`dashboard/relay.py::RelaySession.rpc`, mismo mecanismo que ya usa el shim de adb). En modo
+relay, `RelaySession.rpc` es una corrutina y el agente corre en un hilo de threadpool (ver
+`ws.py` abajo) -- se despacha con `asyncio.run_coroutine_threadsafe(coro, loop)` contra el
+event loop real del WebSocket, guardado al conectar.
+
+**`plugins/aipwn/query_context.py`** (nuevo) -- `resolve_package_context(package)`: reusa
+`_load_analysis_json` (de `aipwn/__init__.py`) y `_find_decompiled_dir` (de `aipwn/aipwn.py`)
+tal cual, mismas fuentes que ya usa `nutcracker aipwn` por CLI -- sin duplicar la lógica de
+localizar el análisis/decompilado más reciente.
+
+**Wiring del dashboard**:
+- `ws.py`: nuevo `/ws/query/{package}` -- primer frame del cliente es JSON de conexión
+  (`{"serial", "relay"}`, mismo significado que `QueuePayload`), resuelve device (serial/
+  relay/ninguno -- modo estático puro), instancia un `QueryAgent` por conexión (estado de
+  conversación vive lo que dura el socket), y por cada mensaje corre `agent.ask()` en un
+  hilo de fondo reenviando cada evento (`tool`/`tool_result`/`image`/`assistant`/`error`)
+  por una `queue.Queue` con polling acotado -- mismo patrón anti-hang que `ws_job`
+  (`_POLL_TIMEOUT_S`, ver el comentario del fix de 2026-08-03 sobre threads colgados).
+- `server.py`/`dashboard/__init__.py`: `create_app`/`create_router` reciben `llm_config`
+  (el mismo bloque `llm:` de config.yaml que ya usa aipwn -- cero config nueva, decisión
+  del usuario) y lo pasan a `ws.set_query_config`.
+- `api.py`: `GET /api/query/available` -- `{"available": aipwn_instalado and bool(llm_config)}`,
+  para que el frontend deshabilite la pestaña con gracia si falta cualquiera de los dos.
+
+**Frontend** (`static/index.html`): pestaña "Pentest asistido" con selector de device
+(serial + checkbox "usar relay", mismo patrón que la pestaña Dispositivo) y un transcript
+que distingue visualmente tool calls (tenue, `▸ ejecutando X(...)`) de las respuestas del
+agente, más miniaturas inline de los screenshots que ve el LLM.
+
+**Verificado en vivo** (no solo tests): conectado a `/ws/query/sh.nutcracker.nutbank` en
+modo estático puro (sin device) contra el LLM real configurado (Kimi-K2.6 vía Azure) --
+"¿qué secretos hay y son reales?" disparó `list_secrets`, y la respuesta citó datos reales
+del fixture (31 secretos, 12 confirmados por aipwn, AWS key y Stripe key reales de
+`Secrets.java`) -- confirma el pipeline completo (WS → tool dispatch → store/reportes → LLM)
+funciona end-to-end, no solo con mocks.
+
+**Tests nuevos**: `test_aipwn_query_tools.py` (tools de findings/componentes/secretos/
+exploit_results contra datos de archivo reales + `DeviceIO` en ambos modos, serial con
+`subprocess.run` mockeado y relay con una `RelaySession` falsa vía `asyncio.run_coroutine_
+threadsafe` real), `test_aipwn_query_agent.py` (`QueryAgent.ask` con `LLMClient.chat`
+mockeado -- secuencia de eventos, límite de pasos, no crashea con device=None, conversación
+persiste entre turnos), `test_ws_query.py` (integración FastAPI TestClient del WS completo:
+roundtrip estático, forwarding de eventos de tool, disponibilidad sin `llm_config`, relay
+sin sesión conectada). 29 tests nuevos.
+
+Nota: `plugins/aipwn/` es un repo git separado (ver docstring de `aipwn/__init__.py`) --
+`query_agent.py`/`query_tools.py`/`query_context.py` quedan sin trackear ahí, no en este repo.
+
+Suite completa: 484 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
