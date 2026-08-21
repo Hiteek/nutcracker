@@ -3173,3 +3173,148 @@ Nota: `plugins/aipwn/` es un repo git separado (ver docstring de `aipwn/__init__
 `query_agent.py`/`query_tools.py`/`query_context.py` quedan sin trackear ahí, no en este repo.
 
 Suite completa: 484 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+### Fix: preflight uniforme de device para las tools dinámicas (encontrado en vivo, mismo día)
+
+En la primera sesión real del co-piloto sin device conectado (y sin `adb` instalado en el
+host de prueba), las tools dinámicas reusadas de `frida_agent_tools.py` fallaban cada una a
+su manera: `sniff_network_calls` enterraba "ERROR: adb no encontrado" en texto crudo,
+`run_frida_script` devolvía `app_running: false` con una nota que ni mencionaba adb
+(sugiriendo falsamente detección anti-Frida), y `enumerate_runtime_classes` lo envolvía en
+"no se pudo parsear la respuesta de Frida". El LLM (aunque el system prompt le pedía
+explícitamente "si falla por falta de device, decilo claro, no reintentes a ciegas") no
+tenía forma de reconocer que las tres eran el mismo problema y siguió probando herramientas
+dinámicas distintas, quemando turnos del operador sin llegar a ninguna conclusión útil.
+
+Fix en `query_tools.py`: nueva `_check_device_ready(ctx, device)` -- preflight uniforme que
+corre ANTES de delegar a cualquier tool dinámica (las 9 runtime reusadas + las 5 de UI/
+pantalla nuevas, ver `_RUNTIME_DEVICE_TOOL_NAMES`), en dos capas:
+1. Sin `device`/`ctx.serial`/`ctx.frida_host` (la sesión no tiene ningún dispositivo
+   configurado) → error inmediato, sin tocar subprocess para nada.
+2. Con dispositivo configurado pero sin el binario `adb` en el PATH del host del dashboard
+   → error inmediato distinto, aclarando que es un problema de host, no de dispositivo.
+
+`get_frida_output_history` queda deliberadamente afuera del preflight -- lee
+`ctx.frida_run_history` en memoria, nunca toca adb/Frida. 5 tests nuevos cubren las dos
+capas del preflight y confirman que `run_frida_script` sin device NUNCA llega a invocar
+`subprocess.run` (antes del fix, sí llegaba y fallaba tarde y confuso).
+
+Suite completa: 489 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+### Fix real (no solo mensajería): run_frida_script ahora funciona en modo relay
+
+El fix anterior (preflight uniforme) solo mejoraba la SEÑAL de error -- no hacía que las
+tools dinámicas funcionaran de verdad en modo relay. Diagnóstico del usuario en vivo
+("el puente ADB sigue inaccesible desde el entorno donde corren mis herramientas
+dinámicas") era correcto: encontrado el porqué exacto.
+
+**Causa raíz**: existe un shim de `adb` (`toolbox/relay_adb_shim/adb`) que traduce
+llamadas `adb ...` a RPCs contra el relay -- es lo que hace que Frida/adb "funcionen" en
+modo relay para jobs de la cola. Pero se activa anteponiendo su directorio al **PATH del
+SUBPROCESO** cuando `engine.py::_run_job` lanza `nutcracker aipwn ...` como proceso
+separado (ver `engine.py` línea ~398-402). `QueryAgent` corre **in-process** dentro del
+propio dashboard (a propósito, para ser interactivo) -- nunca se lanza un subproceso nuevo,
+así que ese PATH nunca se arma, y `shutil.which("adb")`/`subprocess.run(["adb",...])` en
+`frida_capture.py`/`frida_agent_tools.py` siempre resuelven el `adb` real del proceso del
+dashboard, que no tiene ruta al teléfono (solo el navegador la tiene). Agravante: dentro de
+`setup_frida_server`, esos `adb shell` corren con `capture_output=True` y **nunca chequean
+el returncode** -- "éxito" en silencio aunque el comando haya fallado por completo. Por eso
+el síntoma observado (`run_frida_script` → `app_running: false` con una nota que sugería
+falsamente detección anti-Frida) no tenía nada que ver con el motivo real.
+
+**Fix**: en vez de replicar el mecanismo del shim (PATH + HTTP loopback, pensado para un
+proceso realmente separado), se aprovecha que `QueryAgent` YA tiene acceso directo en
+memoria al objeto `RelaySession` vía `DeviceIO` -- más simple y sin el round-trip HTTP.
+
+- `frida_capture.py::setup_frida_server`/`launch_frida_capture` -- nuevos parámetros
+  opcionales `shell_fn: Callable[[str], str] | None` y `logcat_fn: Callable[[float], str]
+  | None` (default `None` = comportamiento de siempre, cero cambio para CLI/jobs). Con
+  `shell_fn` provisto: `setup_frida_server` corre sus 3 comandos por ahí en vez de
+  `subprocess.run(adb_args + ...)`; `launch_frida_capture` salta el gate de
+  `shutil.which("adb")` (ya no hace falta), limpia logcat y chequea `pidof` final también
+  por `shell_fn`. El proceso de `frida` en sí sigue siendo siempre local (ya funcionaba
+  bien por el túnel TCP crudo del relay, puerto 27042, no es el de control de adbd) -- no
+  se toca. Con `logcat_fn` provisto, la correlación de logcat deja de ser streaming
+  línea-a-línea (imposible sobre el RPC del relay, igual que el propio shim) y pasa a ser
+  una sola captura acotada en un hilo de fondo, igual criterio que
+  `relay_adb_shim/adb::_cmd_logcat`.
+- `query_tools.py::DeviceIO` -- nuevo método `logcat(args, duration_seconds)`: relay usa el
+  RPC dedicado `"logcat"` (NO el `"shell"` genérico -- logcat nunca termina solo); serial
+  usa `adb logcat` vía `Popen` + `communicate(timeout=...)`, capturando la salida parcial en
+  el `TimeoutExpired` en vez de propagar la excepción (a diferencia de `shell()`, acá el
+  timeout es el flujo esperado, no un error).
+- `query_agent.py::QueryAgent._execute_frida` -- cuando `self.device.is_relay`, arma
+  `shell_fn=self.device.shell`/`logcat_fn=lambda dur: self.device.logcat(duration_seconds=dur)`
+  y se los pasa a `launch_frida_capture`. Sin relay (serial/nada), no pasa nada -- idéntico
+  a antes.
+- `query_tools.py::_check_device_ready` -- ahora recibe también `name` y distingue en modo
+  relay: `run_frida_script` y las tools propias de UI/pantalla (siempre vía `DeviceIO`) SÍ
+  están listas; el resto de las runtime reusadas (`sniff_network_calls`,
+  `enumerate_runtime_classes`, etc. -- **limitación conocida, no arreglada en este pase**)
+  todavía shellean a un `adb` local sin ruta al device en relay, así que se rechazan con un
+  mensaje que le dice al LLM explícitamente qué SÍ puede usar en su lugar, en vez de dejarlas
+  fallar confuso más adelante.
+
+**Tests nuevos**: `test_aipwn_frida_capture_relay.py` (`setup_frida_server`/
+`launch_frida_capture` con `shell_fn`/`logcat_fn` -- incluye un test de integración
+end-to-end de `launch_frida_capture` completo con el proceso de `frida` mockeado,
+confirmando que CERO llamadas a `subprocess.run` tocan `adb`; y que sin `shell_fn` el
+comportamiento es exactamente el de antes), más tests nuevos de `DeviceIO.logcat` (relay
+con RPC dedicado, serial con output parcial en timeout) y del wiring de
+`_execute_frida` (arma `shell_fn`/`logcat_fn` solo en relay). 11 tests nuevos.
+
+Suite completa: 500 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+### Extensión: las 8 tools runtime restantes también funcionan en relay ("hacé todo")
+
+El fix anterior solo cubría `run_frida_script` + las de UI/pantalla. El usuario pidió
+extender la cobertura al resto (`enumerate_runtime_classes`, `get_class_methods`,
+`get_loaded_native_libs`, `enumerate_native_exports`, `resolve_native_symbol`,
+`probe_security_violations`, `sniff_network_calls`, `trace_method_execution`).
+
+**Hallazgo clave**: las 8 dependen de una única función interna,
+`frida_agent_tools.py::_run_frida_query` -- y su gate de `adb` (`shutil.which("adb")`) es
+**código muerto**: la función nunca usa esa variable para nada más, solo lanza el binario
+`frida` directo (`-H`/`-D`/`-U`). Con `frida_host` seteado (relay), `frida -H host:port`
+habla por el túnel TCP crudo del relay sin necesitar adb para nada -- el gate solo tenía
+sentido como proxy heurístico para los modos `-U`/`-D`. Fix de una función: saltar el gate
+específicamente cuando `ctx.frida_host` está seteado (sin tocar el comportamiento `-U`/`-D`
+existente). Arregla las 8 tools de un saque.
+
+**Segundo hallazgo**: `run_frida_script` con `spawn_gated=True` (usado para bypasses RASP
+agresivos, DT_PREINIT_ARRAY) es un camino SEPARADO (`_run_frida_spawngated`, vía frida-python
+bindings directo) del que ya se había arreglado (`launch_frida_capture`, para
+`spawn_gated=False`). Ese sí necesitaba adb de verdad (logcat clear/stream, chequeo final de
+`pidof`) -- se le agregó el mismo tipo de canal alternativo:
+
+- `frida_agent_tools.py::ToolContext` -- dos atributos nuevos, `device_shell`/`device_logcat`
+  (`Callable | None`, default `None` = cero cambio para CLI/FridaAgent), pensados como el
+  canal genérico y reusable para CUALQUIER tool de `frida_agent_tools.py` que necesite
+  hablarle al device sin adb local -- no solo para `_run_frida_spawngated`.
+- `_run_frida_spawngated` -- usa `ctx.device_shell`/`ctx.device_logcat` cuando están
+  seteados (logcat -c, captura de logcat en un hilo de fondo -- una sola ventana acotada,
+  no streaming, mismo criterio que `logcat_fn` de `launch_frida_capture` -- y `pidof` final)
+  en vez de `_adb_cmd(ctx)` + `subprocess`.
+- `query_agent.py::QueryAgent.__init__` -- arma `device_shell`/`device_logcat` UNA vez (antes
+  se armaban ad-hoc solo dentro de `_execute_frida`) y los pasa al `ToolContext` -- fuente
+  única de verdad, compartida por `launch_frida_capture` (via `_execute_frida`) y por
+  `_run_frida_spawngated` (via `ctx.device_shell` directo).
+- `query_tools.py::_RELAY_READY_REUSED_TOOL_NAMES` -- ahora incluye las 9 tools (las 8 +
+  `run_frida_script`); con las 5 propias de UI/pantalla, **el catálogo completo de tools
+  dinámicas ya funciona en modo relay**. El mensaje de "no soporta relay" en
+  `_check_device_ready` queda como red de seguridad para una tool futura que se agregue sin
+  adaptarla, no para ninguna del catálogo actual.
+
+**Tests nuevos**: `test_aipwn_frida_agent_tools_relay.py` (`_run_frida_query` salta el gate
+de adb con `frida_host` pero lo sigue exigiendo sin él -- comportamiento `-U`/`-D` intacto;
+`_run_frida_spawngated` con `device_shell`/`device_logcat` no toca `subprocess` para nada,
+sin ellos mantiene el comportamiento de siempre), más la actualización de
+`test_check_device_ready_relay_*` en `test_aipwn_query_tools.py` para reflejar que las 14
+tools dinámicas del catálogo actual pasan el preflight en relay, y un test de red de
+seguridad para una tool hipotética futura sin adaptar. 8 tests nuevos.
+
+Suite completa: 503 pasan (mismos 6 fallos preexistentes sin relación, ninguno nuevo).
+
+Con esto, el catálogo completo de tools dinámicas del co-piloto (14: las 9 reusadas de
+Frida + las 5 de UI/pantalla propias) funciona igual en modo relay que en modo serial --
+sin limitaciones conocidas pendientes para las tools existentes.
